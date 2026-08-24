@@ -8,7 +8,6 @@ from typing import Any
 
 import httpx
 from nonebot import logger
-from nonebot_plugin_xfetch.clients.tweet_urls import TWEET_URL_RE
 
 from ..config import (
     LIMIT_PER_TAG,
@@ -21,6 +20,7 @@ from ..config import (
     TAGFETCH_REMOTE_TOKEN,
 )
 from ..models import DiscoveredPost
+from .tweet_urls import TWEET_URL_RE
 
 POLL_PATH = "/api/tagfetch/poll"
 

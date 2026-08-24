@@ -6,11 +6,17 @@ import asyncio
 import json
 from typing import Any
 
+import httpx
 from nonebot import logger
-from nonebot_plugin_xfetch.models.tweet import TweetConversation
 
-from ..config import GEMINI_TIMEOUT_SECONDS
+from ..config import (
+    GEMINI_API_KEY,
+    GEMINI_API_URL,
+    GEMINI_MODEL,
+    GEMINI_TIMEOUT_SECONDS,
+)
 from ..models import DownloadedImage, SafetyReview
+from ..models.tweet import TweetConversation
 from .media import MediaDownloadError, image_data_url, prepare_audit_images
 
 _ALLOWED_CATEGORIES = {
@@ -34,6 +40,41 @@ _REVIEW_PROMPT = """你是面向中国大陆 QQ 群的严格推文安全审核�
 只返回一个 JSON 对象，不要 Markdown，不要解释，字段必须完整：
 {"approved":false,"categories":["other_unsuitable"],"reason":"简短原因","reviewed_image_count":0}
 通过时 categories 必须为空数组；拒绝时 reason 和 categories 必须非空。reviewed_image_count 必须等于实际收到的图片数量。"""
+
+
+async def _request_gemini(content: list[dict[str, Any]]) -> str:
+    """Call the configured OpenAI-compatible Gemini endpoint exactly once."""
+    if not GEMINI_API_KEY:
+        raise ValueError("gemini_api_key_missing")
+    payload = {
+        "model": GEMINI_MODEL,
+        "messages": [{"role": "user", "content": content}],
+        "temperature": 0,
+        "max_tokens": 400,
+        "response_format": {"type": "json_object"},
+    }
+    async with httpx.AsyncClient(
+        timeout=GEMINI_TIMEOUT_SECONDS,
+        trust_env=False,
+    ) as client:
+        response = await client.post(
+            GEMINI_API_URL,
+            headers={
+                "Authorization": GEMINI_API_KEY,
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
+    if response.status_code != 200:
+        raise ValueError(f"gemini_http_{response.status_code}")
+    try:
+        response_payload = response.json()
+        raw = response_payload["choices"][0]["message"]["content"]
+    except (IndexError, KeyError, TypeError, ValueError) as exc:
+        raise ValueError("invalid_gemini_response") from exc
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("empty_gemini_response")
+    return raw.strip()
 
 
 def _review_text(conversation: TweetConversation) -> str:
@@ -114,20 +155,10 @@ async def review_candidate(
             {"type": "image_url", "image_url": {"url": image_data_url(image)}}
             for image in audit_images
         )
-        from nonebot_plugin_kabubu_chat.core.client import get_gemini_service
-
-        service = get_gemini_service()
-        completion = await asyncio.wait_for(
-            service.complete(
-                [{"role": "user", "content": content}],
-                temperature=0,
-                max_tokens=400,
-                response_format={"type": "json_object"},
-                call_type="tagfetch_safety_review",
-            ),
+        raw = await asyncio.wait_for(
+            _request_gemini(content),
             timeout=GEMINI_TIMEOUT_SECONDS,
         )
-        raw = (completion.choices[0].message.content or "").strip()
         review = _parse_review(raw, len(audit_images))
         logger.info(
             "[TagfetchSafety] review finished tweet={} status={} categories={}",

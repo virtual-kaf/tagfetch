@@ -8,12 +8,12 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from nonebot import logger
-from nonebot_plugin_xfetch.clients.fxtwitter import fetch_conversation
-from nonebot_plugin_xfetch.models.tweet import TweetConversation
 
+from ..clients.fxtwitter import fetch_conversation
 from ..clients.remote_grok import RemoteDiscoveryError, remote_fetch_urls
 from ..config import FETCH_CONCURRENCY, LOOKBACK, MIN_LIKES
 from ..models import DiscoveredPost, PreparedCandidate
+from ..models.tweet import TweetConversation
 from ..storage import has_pending_delivery, is_rejected, record_rejection
 from .media import MediaDownloadError, download_candidate_images
 from .safety import review_candidate

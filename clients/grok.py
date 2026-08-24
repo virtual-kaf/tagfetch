@@ -6,7 +6,6 @@ import json
 
 import httpx
 from nonebot import logger
-from nonebot_plugin_xfetch.clients.tweet_urls import TWEET_URL_RE
 
 from ..config import (
     GROK_API_KEY,
@@ -17,6 +16,7 @@ from ..config import (
     MIN_LIKES,
     REQUEST_TIMEOUT_SECONDS,
 )
+from .tweet_urls import TWEET_URL_RE
 
 
 class GrokDiscoveryError(RuntimeError):

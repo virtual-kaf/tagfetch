@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 
-from nonebot_plugin_xfetch.models.tweet import TweetConversation
+from .tweet import TweetConversation
 
 
 @dataclass(frozen=True)

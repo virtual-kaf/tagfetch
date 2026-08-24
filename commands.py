@@ -4,6 +4,7 @@ from nonebot import get_driver, on_command
 from nonebot.adapters.onebot.v11 import GroupMessageEvent, Message
 from nonebot.params import CommandArg
 
+from .config import ADMIN_IDS, SUPER_ADMIN_IDS
 from .services.switches import is_master_on
 from .storage import is_group_enabled, set_group_enabled
 
@@ -18,16 +19,7 @@ tagfetch_cmd = on_command(
 
 
 def _configured_admin_ids() -> set[int]:
-    try:
-        from nonebot_plugin_kabubu_chat.config import get_config
-
-        config = get_config()
-        return {
-            *map(int, config.kabubu_admin_list),
-            *map(int, config.kabubu_super_admin),
-        }
-    except (AttributeError, ImportError, TypeError, ValueError):
-        return set()
+    return set(ADMIN_IDS | SUPER_ADMIN_IDS)
 
 
 def _is_authorized(event: GroupMessageEvent) -> bool:

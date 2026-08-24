@@ -10,11 +10,13 @@ else:
     from nonebot.plugin import PluginMetadata
 
     from .commands import tagfetch_cmd
+    from .renderer import shutdown as shutdown_renderer
     from .scheduler import check_tagfetch
     from .storage import initialize_database
 
     initialize_database()
 
+    get_driver().on_shutdown(shutdown_renderer)
     __plugin_meta__ = PluginMetadata(
         name="tagfetch",
         description="安全发现并推送热门 hashtag 推文",

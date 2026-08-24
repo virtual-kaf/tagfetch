@@ -8,7 +8,6 @@ from collections.abc import Iterable
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import httpx
-from nonebot_plugin_xfetch.models.tweet import TweetConversation, TweetItem
 from PIL import Image, ImageOps
 
 from ..config import (
@@ -18,6 +17,7 @@ from ..config import (
     SINGLE_ORIGINAL_MAX_BYTES,
 )
 from ..models import DownloadedImage
+from ..models.tweet import TweetConversation, TweetItem
 
 _ALLOWED_IMAGE_TYPES = {
     "image/jpeg": "image/jpeg",

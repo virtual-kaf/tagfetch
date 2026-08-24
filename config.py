@@ -16,9 +16,11 @@ except ImportError:  # pragma: no cover - standalone remote helper
     get_driver = None
 
 CST = ZoneInfo("Asia/Shanghai")
+JST = ZoneInfo("Asia/Tokyo")
 PLUGIN_DIR = Path(__file__).resolve().parent
 DATA_DIR = PLUGIN_DIR / "data"
 STATE_DB = DATA_DIR / "tagfetch_state.sqlite3"
+CARD_DIR = DATA_DIR / "cards"
 
 MIN_LIKES = 300
 LOOKBACK_HOURS = 2
@@ -28,6 +30,7 @@ MAX_TAGS = 32
 REQUEST_TIMEOUT_SECONDS = 120.0
 GEMINI_TIMEOUT_SECONDS = 60.0
 FETCH_CONCURRENCY = 4
+FXTWITTER_API_BASE = "https://api.fxtwitter.com"
 
 SINGLE_ORIGINAL_MAX_BYTES = 20 * 1024 * 1024
 CANDIDATE_ORIGINALS_MAX_BYTES = 60 * 1024 * 1024
@@ -78,6 +81,21 @@ def _get_config_str(name: str, default: str = "") -> str:
     return default if value is None else str(value)
 
 
+def _get_config_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(_get_config_value(name, default))
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(value, maximum))
+
+
+def _authorization_value(raw: str) -> str:
+    value = raw.strip()
+    if not value or value.casefold().startswith("bearer "):
+        return value
+    return f"Bearer {value}"
+
+
 def _normalize_tag(value: object) -> str | None:
     if not isinstance(value, str):
         return None
@@ -115,6 +133,31 @@ def parse_tags(raw: object) -> tuple[str, ...]:
     return tuple(tags)
 
 
+def parse_id_set(raw: object) -> frozenset[int]:
+    """Parse an integer ID list from NoneBot config or a JSON environment value."""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return frozenset()
+    if not isinstance(raw, (list, tuple, set, frozenset)):
+        return frozenset()
+    values: set[int] = set()
+    for item in raw:
+        try:
+            values.add(int(item))
+        except (TypeError, ValueError):
+            continue
+    return frozenset(values)
+
+
+TAGFETCH_RENDER_TIMEOUT = _get_config_int("KABUBU_TAGFETCH_RENDER_TIMEOUT", 90, 30, 180)
+TAGFETCH_RENDER_BROWSER_MAX_USES = _get_config_int(
+    "KABUBU_TAGFETCH_RENDER_BROWSER_MAX_USES", 20, 1, 100
+)
+ADMIN_IDS = parse_id_set(_get_config_value("KABUBU_ADMIN_LIST", []))
+SUPER_ADMIN_IDS = parse_id_set(_get_config_value("KABUBU_SUPER_ADMIN", []))
+
 TAGS = parse_tags(_get_config_value("KABUBU_TAGFETCH_TAGS", "[]"))
 
 TAGFETCH_REMOTE_ENABLED = _get_config_str(
@@ -140,3 +183,17 @@ GROK_API_KEY = (
 GROK_MODEL = _get_config_str(
     "KABUBU_GROK_MODEL", "grok-4.20-0309-non-reasoning"
 ).strip()
+
+GEMINI_API_KEY_RAW = _get_config_str("KABUBU_GEMINI_API_KEY", "").strip()
+GEMINI_API_KEY = _authorization_value(GEMINI_API_KEY_RAW)
+GEMINI_BASE_URL = (
+    _get_config_str("KABUBU_GEMINI_BASE_URL", "https://api.vectorengine.cn/v1")
+    .strip()
+    .rstrip("/")
+)
+GEMINI_API_URL = (
+    GEMINI_BASE_URL
+    if GEMINI_BASE_URL.endswith("/chat/completions")
+    else f"{GEMINI_BASE_URL}/chat/completions"
+)
+GEMINI_MODEL = _get_config_str("KABUBU_GEMINI_MODEL", "gemini-3.5-flash").strip()

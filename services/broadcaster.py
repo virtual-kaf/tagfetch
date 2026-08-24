@@ -1,4 +1,4 @@
-"""Two-stage OneBot delivery using xfetch rendering and base64 helpers."""
+"""Two-stage OneBot delivery using Tagfetch-owned rendering and image helpers."""
 
 from __future__ import annotations
 
@@ -8,22 +8,22 @@ from pathlib import Path
 
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import Bot
-from nonebot_plugin_xfetch.renderer import render_conversation_card
-from nonebot_plugin_xfetch.services.image_sender import (
-    image_cq_from_path,
-    image_segment_from_path,
-)
 
 from ..models import PreparedCandidate
+from ..renderer import render_conversation_card
 from ..storage import (
     has_delivery,
     mark_originals_sent,
     record_card_delivery,
 )
+from .image_sender import (
+    image_cq_from_path,
+    image_segment_from_path,
+)
 
 
 def conversation_without_avatars(candidate: PreparedCandidate):
-    """Return a renderer-only copy; xfetch's original conversation is untouched."""
+    """Return an avatar-free renderer copy without mutating fetched data."""
     rendered = copy.deepcopy(candidate.conversation)
     items = [rendered.root, *rendered.ancestors, rendered.target, rendered.quote]
     for item in items:
@@ -31,8 +31,7 @@ def conversation_without_avatars(candidate: PreparedCandidate):
             item.author.avatar_url = ""
             item.translated_text = ""
     if rendered.target is not None:
-        # xfetch uses target.id only as its cache filename. A private prefix keeps
-        # tagfetch's avatar-free card from overwriting xfetch's normal card.
+        # Keep generated card filenames private to Tagfetch.
         rendered.target.id = f"tagfetch_{candidate.tweet_id}"
     return rendered
 
