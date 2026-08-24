@@ -89,8 +89,21 @@ def _parse_review(raw: str, image_count: int) -> SafetyReview:
 async def review_candidate(
     conversation: TweetConversation, images: list[DownloadedImage]
 ) -> SafetyReview:
+    target_id = conversation.target.id if conversation.target is not None else "missing"
+    logger.info(
+        "[TagfetchSafety] review starting tweet={} images={} image_bytes={}",
+        target_id,
+        len(images),
+        sum(len(image.data) for image in images),
+    )
     try:
         audit_images = prepare_audit_images(images)
+        logger.info(
+            "[TagfetchSafety] audit payload ready tweet={} images={} image_bytes={}",
+            target_id,
+            len(audit_images),
+            sum(len(image.data) for image in audit_images),
+        )
         content: list[dict[str, Any]] = [
             {
                 "type": "text",
@@ -115,7 +128,14 @@ async def review_candidate(
             timeout=GEMINI_TIMEOUT_SECONDS,
         )
         raw = (completion.choices[0].message.content or "").strip()
-        return _parse_review(raw, len(audit_images))
+        review = _parse_review(raw, len(audit_images))
+        logger.info(
+            "[TagfetchSafety] review finished tweet={} status={} categories={}",
+            target_id,
+            review.status,
+            len(review.categories),
+        )
+        return review
     except (asyncio.TimeoutError, MediaDownloadError, TypeError, ValueError):
         logger.warning("[TagfetchSafety] review inconclusive", exc_info=True)
     except Exception:  # noqa: BLE001 - external Gemini client failures are fail-closed

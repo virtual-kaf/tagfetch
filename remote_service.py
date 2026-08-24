@@ -82,7 +82,9 @@ def load_remote_settings() -> RemoteServiceSettings:
 
     def read(name: str, default: str) -> str:
         value = os.getenv(name)
-        return value if value is not None else str(getattr(loaded, name.lower(), default))
+        return (
+            value if value is not None else str(getattr(loaded, name.lower(), default))
+        )
 
     return RemoteServiceSettings.from_raw(
         enabled=read("KABUBU_TAGFETCH_REMOTE_ENABLED", "false"),
@@ -93,11 +95,19 @@ def load_remote_settings() -> RemoteServiceSettings:
 
 
 def _json_response(
-    *, status: int, ok: bool, posts: list[dict[str, str]] | None = None,
-    error: str | None = None
+    *,
+    status: int,
+    ok: bool,
+    posts: list[dict[str, str]] | None = None,
+    error: str | None = None,
 ) -> web.Response:
     return web.json_response(
-        {"ok": ok, "posts": posts or [], "source": "grok" if ok else None, "error": error},
+        {
+            "ok": ok,
+            "posts": posts or [],
+            "source": "grok" if ok else None,
+            "error": error,
+        },
         status=status,
     )
 
@@ -116,7 +126,16 @@ def _authorized(header: str | None, expected: str) -> bool:
 
 async def _poll(request: web.Request) -> web.Response:
     settings = request.app[SETTINGS_KEY]
+    logger.info(
+        "[TagfetchRemote] poll received peer={} content_length={}",
+        request.remote or "unknown",
+        request.content_length,
+    )
     if not _authorized(request.headers.get("Authorization"), settings.token):
+        logger.warning(
+            "[TagfetchRemote] poll rejected reason=unauthorized peer={}",
+            request.remote or "unknown",
+        )
         response = _json_response(status=401, ok=False, error="unauthorized")
         response.headers["WWW-Authenticate"] = "Bearer"
         return response
@@ -137,6 +156,11 @@ async def _poll(request: web.Request) -> web.Response:
     try:
         validate_query_options(body)
         tags = normalize_requested_tags(body.get("tags"))
+        logger.info(
+            "[TagfetchRemote] request validated tags={} lookback_hours={}",
+            len(tags),
+            body["lookback_hours"],
+        )
         fetcher = cast(Fetcher, request.app[FETCHER_KEY])
         posts = await fetcher(
             tags,
@@ -152,6 +176,7 @@ async def _poll(request: web.Request) -> web.Response:
     except Exception:  # noqa: BLE001 - HTTP boundary must return a closed error
         logger.exception("[TagfetchRemote] unexpected poll failure")
         return _json_response(status=500, ok=False, error="internal_error")
+    logger.info("[TagfetchRemote] poll succeeded posts={}", len(posts))
     return _json_response(status=200, ok=True, posts=posts)
 
 

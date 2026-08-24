@@ -41,7 +41,13 @@ async def _render_cards(
     candidates: list[PreparedCandidate],
 ) -> dict[str, Path]:
     cards: dict[str, Path] = {}
+    logger.info(
+        "[TagfetchBroadcast] render batch starting candidates={}", len(candidates)
+    )
     for candidate in candidates:
+        logger.info(
+            "[TagfetchBroadcast] card render starting tweet={}", candidate.tweet_id
+        )
         try:
             paths = await render_conversation_card(
                 conversation_without_avatars(candidate)
@@ -54,6 +60,20 @@ async def _render_cards(
             continue
         if paths:
             cards[candidate.tweet_id] = Path(paths[0])
+            logger.info(
+                "[TagfetchBroadcast] card render finished tweet={}",
+                candidate.tweet_id,
+            )
+        else:
+            logger.warning(
+                "[TagfetchBroadcast] card render returned no path tweet={}",
+                candidate.tweet_id,
+            )
+    logger.info(
+        "[TagfetchBroadcast] render batch finished requested={} rendered={}",
+        len(candidates),
+        len(cards),
+    )
     return cards
 
 
@@ -84,9 +104,7 @@ async def _send_cards(
         if image is None:
             return []
         try:
-            await bot.call_api(
-                "send_group_msg", group_id=int(group_id), message=image
-            )
+            await bot.call_api("send_group_msg", group_id=int(group_id), message=image)
         except Exception:  # noqa: BLE001 - adapter errors are isolated per group
             logger.exception(
                 "[TagfetchBroadcast] direct card failed group={} tweet={}",
@@ -110,9 +128,7 @@ async def _send_cards(
             "send_group_forward_msg", group_id=int(group_id), messages=nodes
         )
     except Exception:  # noqa: BLE001 - adapter errors are isolated per group
-        logger.exception(
-            "[TagfetchBroadcast] merged cards failed group={}", group_id
-        )
+        logger.exception("[TagfetchBroadcast] merged cards failed group={}", group_id)
         return []
     return included
 
@@ -120,9 +136,7 @@ async def _send_cards(
 async def _send_originals(
     bot: Bot, group_id: str, candidates: list[PreparedCandidate]
 ) -> bool:
-    originals = [
-        image for candidate in candidates for image in candidate.originals
-    ]
+    originals = [image for candidate in candidates for image in candidate.originals]
     if not originals:
         return True
     with tempfile.TemporaryDirectory(prefix="tagfetch_originals_") as directory:
@@ -172,7 +186,17 @@ async def broadcast_to_groups(
     bot: Bot, candidates: list[PreparedCandidate], group_ids: list[str]
 ) -> None:
     if not candidates or not group_ids:
+        logger.info(
+            "[TagfetchBroadcast] broadcast skipped candidates={} groups={}",
+            len(candidates),
+            len(group_ids),
+        )
         return
+    logger.info(
+        "[TagfetchBroadcast] broadcast starting candidates={} groups={}",
+        len(candidates),
+        len(group_ids),
+    )
     cards = await _render_cards(candidates)
     for group_id in group_ids:
         try:
@@ -181,6 +205,13 @@ async def broadcast_to_groups(
                 for candidate in candidates
                 if not has_delivery(candidate.tweet_id, group_id)
             ]
+            logger.info(
+                "[TagfetchBroadcast] group starting group={} pending={} "
+                "already_delivered={}",
+                group_id,
+                len(pending),
+                len(candidates) - len(pending),
+            )
             card_sent = await _send_cards(bot, group_id, pending, cards)
             if not card_sent:
                 continue
@@ -190,12 +221,15 @@ async def broadcast_to_groups(
                     group_id,
                     originals_sent=not candidate.originals,
                 )
+            logger.info(
+                "[TagfetchBroadcast] card deliveries recorded group={} count={}",
+                group_id,
+                len(card_sent),
+            )
             with_originals = [
                 candidate for candidate in card_sent if candidate.originals
             ]
-            if with_originals and await _send_originals(
-                bot, group_id, with_originals
-            ):
+            if with_originals and await _send_originals(bot, group_id, with_originals):
                 mark_originals_sent(
                     [candidate.tweet_id for candidate in with_originals], group_id
                 )

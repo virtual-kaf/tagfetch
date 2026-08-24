@@ -81,7 +81,9 @@ def _normalize_result(data: dict, tags: list[str]) -> list[dict[str, str]]:
             raise GrokDiscoveryError("invalid_model_schema")
         tag = requested.get(raw_tag.strip().lstrip("#").casefold())
         if tag is None:
-            logger.warning("[TagfetchRemote] ignored unrequested Grok tag {!r}", raw_tag)
+            logger.warning(
+                "[TagfetchRemote] ignored unrequested Grok tag {!r}", raw_tag
+            )
             continue
         key = tag.casefold()
         for post in raw_posts:

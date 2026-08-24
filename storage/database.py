@@ -123,9 +123,7 @@ def record_rejection(
         )
 
 
-def has_delivery(
-    tweet_id: str, group_id: int | str, *, path: Path = STATE_DB
-) -> bool:
+def has_delivery(tweet_id: str, group_id: int | str, *, path: Path = STATE_DB) -> bool:
     initialize_database(path)
     with _connect(path) as connection:
         row = connection.execute(
@@ -138,7 +136,9 @@ def has_delivery(
 def has_pending_delivery(
     tweet_id: str, group_ids: Iterable[int | str], *, path: Path = STATE_DB
 ) -> bool:
-    return any(not has_delivery(tweet_id, group_id, path=path) for group_id in group_ids)
+    return any(
+        not has_delivery(tweet_id, group_id, path=path) for group_id in group_ids
+    )
 
 
 def record_card_delivery(

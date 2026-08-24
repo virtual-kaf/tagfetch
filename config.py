@@ -123,12 +123,8 @@ TAGFETCH_REMOTE_ENABLED = _get_config_str(
 TAGFETCH_REMOTE_HOST = _get_config_str(
     "KABUBU_TAGFETCH_REMOTE_HOST", "100.98.44.83"
 ).strip()
-TAGFETCH_REMOTE_PORT = _get_config_str(
-    "KABUBU_TAGFETCH_REMOTE_PORT", "8766"
-).strip()
-TAGFETCH_REMOTE_TOKEN = _get_config_str(
-    "KABUBU_TAGFETCH_REMOTE_TOKEN", ""
-).strip()
+TAGFETCH_REMOTE_PORT = _get_config_str("KABUBU_TAGFETCH_REMOTE_PORT", "8766").strip()
+TAGFETCH_REMOTE_TOKEN = _get_config_str("KABUBU_TAGFETCH_REMOTE_TOKEN", "").strip()
 
 GROK_API_URL = _get_config_str(
     "KABUBU_GROK_API_URL", "http://127.0.0.1:8000/v1/chat/completions"

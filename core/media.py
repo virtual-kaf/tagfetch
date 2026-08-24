@@ -34,7 +34,10 @@ class MediaDownloadError(RuntimeError):
 
 def normalize_original_url(url: str) -> str:
     parsed = urlsplit(url)
-    if parsed.scheme.casefold() != "https" or (parsed.hostname or "").casefold() != "pbs.twimg.com":
+    if (
+        parsed.scheme.casefold() != "https"
+        or (parsed.hostname or "").casefold() != "pbs.twimg.com"
+    ):
         raise MediaDownloadError("original_photo_host_not_allowed")
     query = dict(parse_qsl(parsed.query, keep_blank_values=True))
     query["name"] = "orig"
@@ -91,9 +94,9 @@ async def _download_image(
                 mime_type = _ALLOWED_IMAGE_TYPES.get(content_type)
                 if mime_type is None:
                     raise MediaDownloadError("media_content_type_not_allowed")
-                content_encoding = response.headers.get(
-                    "content-encoding", ""
-                ).strip().casefold()
+                content_encoding = (
+                    response.headers.get("content-encoding", "").strip().casefold()
+                )
                 if content_encoding not in {"", "identity"}:
                     raise MediaDownloadError("media_content_encoding_not_allowed")
                 raw_length = response.headers.get("content-length")

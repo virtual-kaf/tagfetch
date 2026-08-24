@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+from time import monotonic
 from typing import Any
 
 import httpx
@@ -88,6 +89,17 @@ def _parse_posts(raw: Any, tags: tuple[str, ...]) -> list[DiscoveredPost]:
 
 async def remote_fetch_urls(tags: tuple[str, ...]) -> list[DiscoveredPost]:
     url = _remote_url()
+    started = monotonic()
+    logger.info(
+        "[TagfetchDiscovery] request starting host={} port={} tags={} "
+        "min_likes={} lookback_hours={} limit_per_tag={}",
+        TAGFETCH_REMOTE_HOST,
+        TAGFETCH_REMOTE_PORT,
+        len(tags),
+        MIN_LIKES,
+        LOOKBACK_HOURS,
+        LIMIT_PER_TAG,
+    )
     try:
         async with httpx.AsyncClient(
             timeout=REQUEST_TIMEOUT_SECONDS, trust_env=False
@@ -103,7 +115,17 @@ async def remote_fetch_urls(tags: tuple[str, ...]) -> list[DiscoveredPost]:
                 },
             )
     except httpx.RequestError as exc:
+        logger.warning(
+            "[TagfetchDiscovery] request failed error_type={} elapsed_seconds={:.2f}",
+            type(exc).__name__,
+            monotonic() - started,
+        )
         raise RemoteDiscoveryError("remote_request_failed") from exc
+    logger.info(
+        "[TagfetchDiscovery] response received status={} elapsed_seconds={:.2f}",
+        response.status_code,
+        monotonic() - started,
+    )
     if response.status_code != 200:
         raise RemoteDiscoveryError(
             f"http_{response.status_code}", status_code=response.status_code
@@ -121,7 +143,7 @@ async def remote_fetch_urls(tags: tuple[str, ...]) -> list[DiscoveredPost]:
         raise RemoteDiscoveryError("invalid_remote_response")
     posts = _parse_posts(body.get("posts"), tags)
     logger.info(
-        "[TagfetchDiscovery] source=remote_grok posts={} tags={}",
+        "[TagfetchDiscovery] response accepted source=remote_grok posts={} tags={}",
         len(posts),
         len(tags),
     )
