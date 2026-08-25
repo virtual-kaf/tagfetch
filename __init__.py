@@ -9,7 +9,7 @@ except ValueError:
 else:
     from nonebot.plugin import PluginMetadata
 
-    from .commands import tagfetch_cmd
+    from .commands import artworks_cmd
     from .renderer import shutdown as shutdown_renderer
     from .scheduler import check_tagfetch
     from .storage import initialize_database
@@ -20,9 +20,9 @@ else:
     __plugin_meta__ = PluginMetadata(
         name="tagfetch",
         description="安全发现并推送热门 hashtag 推文",
-        usage="/kabubu tagfetch on | off | status",
+        usage="/kabubu artworks on | off",
         type="application",
         supported_adapters={"~onebot.v11"},
     )
 
-    __all__ = ["check_tagfetch", "tagfetch_cmd"]
+    __all__ = ["artworks_cmd", "check_tagfetch"]

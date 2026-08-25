@@ -106,9 +106,6 @@ async def _get_browser():
                     "--no-first-run",
                     "--no-default-browser-check",
                     "--mute-audio",
-                    "--renderer-process-limit=1",
-                    "--disk-cache-size=1",
-                    "--media-cache-size=1",
                 ],
             )
         except Exception:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import random
 import tempfile
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -13,10 +14,13 @@ from nonebot.adapters.onebot.v11 import Bot
 
 from ..config import (
     MEDIA_CACHE_DIR,
+    TAGFETCH_CARD_FORWARD_MAX_NODES,
+    TAGFETCH_CARD_FORWARD_MAX_RAW_BYTES,
     TAGFETCH_ONEBOT_FORWARD_MAX_RAW_BYTES,
 )
 from ..models import DownloadedImage, PreparedCandidate
 from ..renderer import render_conversation_card
+from ..renderer import shutdown as shutdown_renderer
 from ..storage import (
     has_delivery,
     mark_originals_sent,
@@ -26,6 +30,21 @@ from .image_sender import (
     image_cq_from_path,
     image_segment_from_path,
 )
+
+GROUP_PUSH_DELAY_MIN_SECONDS = 3.0
+GROUP_PUSH_DELAY_MAX_SECONDS = 5.0
+FORWARD_BATCH_DELAY_SECONDS = 1.0
+
+
+async def _wait_between_group_pushes() -> None:
+    delay = random.uniform(
+        GROUP_PUSH_DELAY_MIN_SECONDS,
+        GROUP_PUSH_DELAY_MAX_SECONDS,
+    )
+    logger.info(
+        "[TagfetchBroadcast] waiting before next group delay_seconds={:.1f}", delay
+    )
+    await asyncio.sleep(delay)
 
 
 def _card_media_url(url: str) -> str:
@@ -37,7 +56,7 @@ def _card_media_url(url: str) -> str:
     ):
         return url
     query = dict(parse_qsl(parsed.query, keep_blank_values=True))
-    query["name"] = "medium"
+    query["name"] = "small"
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), ""))
 
 
@@ -112,6 +131,39 @@ async def _card_node(
     }
 
 
+def _card_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def _card_batches(
+    candidates: list[PreparedCandidate], cards: dict[str, Path]
+) -> tuple[list[list[PreparedCandidate]], list[PreparedCandidate]]:
+    batches: list[list[PreparedCandidate]] = []
+    skipped: list[PreparedCandidate] = []
+    batch: list[PreparedCandidate] = []
+    batch_size = 0
+    for candidate in candidates:
+        image_size = _card_size(cards[candidate.tweet_id])
+        if image_size <= 0 or image_size > TAGFETCH_CARD_FORWARD_MAX_RAW_BYTES:
+            skipped.append(candidate)
+            continue
+        if batch and (
+            len(batch) >= TAGFETCH_CARD_FORWARD_MAX_NODES
+            or batch_size + image_size > TAGFETCH_CARD_FORWARD_MAX_RAW_BYTES
+        ):
+            batches.append(batch)
+            batch = []
+            batch_size = 0
+        batch.append(candidate)
+        batch_size += image_size
+    if batch:
+        batches.append(batch)
+    return batches, skipped
+
+
 async def _send_cards(
     bot: Bot,
     group_id: str,
@@ -123,6 +175,17 @@ async def _send_cards(
         return []
     if len(available) == 1:
         candidate = available[0]
+        image_size = _card_size(cards[candidate.tweet_id])
+        if image_size <= 0 or image_size > TAGFETCH_CARD_FORWARD_MAX_RAW_BYTES:
+            logger.warning(
+                "[TagfetchBroadcast] direct card exceeds safe limit group={} "
+                "tweet={} bytes={} limit_bytes={}",
+                group_id,
+                candidate.tweet_id,
+                image_size,
+                TAGFETCH_CARD_FORWARD_MAX_RAW_BYTES,
+            )
+            return []
         image = await asyncio.to_thread(
             image_segment_from_path, cards[candidate.tweet_id]
         )
@@ -139,23 +202,62 @@ async def _send_cards(
             return []
         return [candidate]
 
-    nodes: list[dict] = []
-    included: list[PreparedCandidate] = []
-    for candidate in available:
-        node = await _card_node(cards[candidate.tweet_id], candidate, str(bot.self_id))
-        if node is not None:
-            nodes.append(node)
-            included.append(candidate)
-    if not nodes:
-        return []
-    try:
-        await bot.call_api(
-            "send_group_forward_msg", group_id=int(group_id), messages=nodes
+    batches, skipped = _card_batches(available, cards)
+    for candidate in skipped:
+        logger.warning(
+            "[TagfetchBroadcast] card skipped by safe limit group={} tweet={} "
+            "bytes={} limit_bytes={}",
+            group_id,
+            candidate.tweet_id,
+            _card_size(cards[candidate.tweet_id]),
+            TAGFETCH_CARD_FORWARD_MAX_RAW_BYTES,
         )
-    except Exception:  # noqa: BLE001 - adapter errors are isolated per group
-        logger.exception("[TagfetchBroadcast] merged cards failed group={}", group_id)
-        return []
-    return included
+    logger.info(
+        "[TagfetchBroadcast] cards split group={} candidates={} batches={} "
+        "max_nodes={} max_raw_bytes={}",
+        group_id,
+        len(available),
+        len(batches),
+        TAGFETCH_CARD_FORWARD_MAX_NODES,
+        TAGFETCH_CARD_FORWARD_MAX_RAW_BYTES,
+    )
+    delivered: list[PreparedCandidate] = []
+    for batch_index, batch in enumerate(batches, start=1):
+        nodes: list[dict] = []
+        included: list[PreparedCandidate] = []
+        for candidate in batch:
+            node = await _card_node(
+                cards[candidate.tweet_id], candidate, str(bot.self_id)
+            )
+            if node is not None:
+                nodes.append(node)
+                included.append(candidate)
+        if nodes:
+            try:
+                await bot.call_api(
+                    "send_group_forward_msg",
+                    group_id=int(group_id),
+                    messages=nodes,
+                )
+            except Exception:  # noqa: BLE001 - isolate one forward batch
+                logger.exception(
+                    "[TagfetchBroadcast] merged cards batch failed group={} batch={}",
+                    group_id,
+                    batch_index,
+                )
+            else:
+                delivered.extend(included)
+                logger.info(
+                    "[TagfetchBroadcast] cards batch sent group={} batch={}/{} "
+                    "nodes={}",
+                    group_id,
+                    batch_index,
+                    len(batches),
+                    len(nodes),
+                )
+        if batch_index < len(batches):
+            await asyncio.sleep(FORWARD_BATCH_DELAY_SECONDS)
+    return delivered
 
 
 _IMAGE_EXTENSIONS = {
@@ -287,6 +389,8 @@ async def _send_originals(
                 batch_index,
                 len(batches),
             )
+            if batch_index < len(batches):
+                await asyncio.sleep(FORWARD_BATCH_DELAY_SECONDS)
     return True
 
 
@@ -344,7 +448,12 @@ async def _broadcast_to_groups(
         len(candidates),
         len(group_ids),
     )
-    cards = await _render_cards(candidates)
+    try:
+        cards = await _render_cards(candidates)
+    finally:
+        # Free Chromium before constructing large OneBot base64 payloads.
+        await shutdown_renderer()
+    has_previous_group = False
     for group_id in group_ids:
         try:
             pending = [
@@ -359,6 +468,11 @@ async def _broadcast_to_groups(
                 len(pending),
                 len(candidates) - len(pending),
             )
+            if not pending:
+                continue
+            if has_previous_group:
+                await _wait_between_group_pushes()
+            has_previous_group = True
             card_sent = await _send_cards(bot, group_id, pending, cards)
             if not card_sent:
                 continue
@@ -376,6 +490,8 @@ async def _broadcast_to_groups(
             with_originals = [
                 candidate for candidate in card_sent if candidate.originals
             ]
+            if with_originals:
+                await asyncio.sleep(FORWARD_BATCH_DELAY_SECONDS)
             if with_originals and await _send_originals(bot, group_id, with_originals):
                 mark_originals_sent(
                     [candidate.tweet_id for candidate in with_originals], group_id
