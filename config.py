@@ -152,6 +152,23 @@ def parse_id_set(raw: object) -> frozenset[int]:
     return frozenset(values)
 
 
+TAGFETCH_SHARED_IMAGE_HOST_DIR = Path(
+    _get_config_str(
+        "KABUBU_TAGFETCH_SHARED_IMAGE_HOST_DIR",
+        "/home/admin/snowluma/data/xfetch_cards",
+    )
+)
+TAGFETCH_SHARED_IMAGE_CONTAINER_DIR = _get_config_str(
+    "KABUBU_TAGFETCH_SHARED_IMAGE_CONTAINER_DIR",
+    "/app/data/xfetch_cards",
+).rstrip("/")
+TAGFETCH_SHARED_IMAGE_TTL_SECONDS = _get_config_int(
+    "KABUBU_TAGFETCH_SHARED_IMAGE_TTL_SECONDS",
+    3600,
+    60,
+    86400,
+)
+
 TAGFETCH_RENDER_TIMEOUT = _get_config_int("KABUBU_TAGFETCH_RENDER_TIMEOUT", 90, 30, 180)
 TAGFETCH_RENDER_BROWSER_MAX_USES = _get_config_int(
     "KABUBU_TAGFETCH_RENDER_BROWSER_MAX_USES", 20, 1, 100
