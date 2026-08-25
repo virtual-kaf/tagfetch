@@ -79,8 +79,8 @@ def conversation_without_avatars(candidate: PreparedCandidate):
 
 async def _render_cards(
     candidates: list[PreparedCandidate],
-) -> dict[str, Path]:
-    cards: dict[str, Path] = {}
+) -> dict[str, list[Path]]:
+    cards: dict[str, list[Path]] = {}
     logger.info(
         "[TagfetchBroadcast] render batch starting candidates={}", len(candidates)
     )
@@ -99,7 +99,7 @@ async def _render_cards(
             )
             continue
         if paths:
-            cards[candidate.tweet_id] = Path(paths[0])
+            cards[candidate.tweet_id] = [Path(path) for path in paths]
             logger.info(
                 "[TagfetchBroadcast] card render finished tweet={}",
                 candidate.tweet_id,
@@ -139,26 +139,39 @@ def _card_size(path: Path) -> int:
 
 
 def _card_batches(
-    candidates: list[PreparedCandidate], cards: dict[str, Path]
-) -> tuple[list[list[PreparedCandidate]], list[PreparedCandidate]]:
-    batches: list[list[PreparedCandidate]] = []
+    candidates: list[PreparedCandidate], cards: dict[str, list[Path]]
+) -> tuple[
+    list[list[tuple[PreparedCandidate, Path]]],
+    list[PreparedCandidate],
+]:
+    """Flatten card pages into safe forward-node batches.
+
+    A candidate is skipped as a unit when any one of its pages is invalid, so
+    delivery accounting can never mark a partially delivered tweet complete.
+    """
+    batches: list[list[tuple[PreparedCandidate, Path]]] = []
     skipped: list[PreparedCandidate] = []
-    batch: list[PreparedCandidate] = []
+    batch: list[tuple[PreparedCandidate, Path]] = []
     batch_size = 0
     for candidate in candidates:
-        image_size = _card_size(cards[candidate.tweet_id])
-        if image_size <= 0 or image_size > TAGFETCH_CARD_FORWARD_MAX_RAW_BYTES:
+        pages = cards[candidate.tweet_id]
+        page_sizes = [_card_size(path) for path in pages]
+        if not pages or any(
+            size <= 0 or size > TAGFETCH_CARD_FORWARD_MAX_RAW_BYTES
+            for size in page_sizes
+        ):
             skipped.append(candidate)
             continue
-        if batch and (
-            len(batch) >= TAGFETCH_CARD_FORWARD_MAX_NODES
-            or batch_size + image_size > TAGFETCH_CARD_FORWARD_MAX_RAW_BYTES
-        ):
-            batches.append(batch)
-            batch = []
-            batch_size = 0
-        batch.append(candidate)
-        batch_size += image_size
+        for path, image_size in zip(pages, page_sizes):
+            if batch and (
+                len(batch) >= TAGFETCH_CARD_FORWARD_MAX_NODES
+                or batch_size + image_size > TAGFETCH_CARD_FORWARD_MAX_RAW_BYTES
+            ):
+                batches.append(batch)
+                batch = []
+                batch_size = 0
+            batch.append((candidate, path))
+            batch_size += image_size
     if batch:
         batches.append(batch)
     return batches, skipped
@@ -168,48 +181,59 @@ async def _send_cards(
     bot: Bot,
     group_id: str,
     candidates: list[PreparedCandidate],
-    cards: dict[str, Path],
+    cards: dict[str, list[Path]],
 ) -> list[PreparedCandidate]:
     available = [candidate for candidate in candidates if candidate.tweet_id in cards]
     if not available:
         return []
     if len(available) == 1:
         candidate = available[0]
-        image_size = _card_size(cards[candidate.tweet_id])
-        if image_size <= 0 or image_size > TAGFETCH_CARD_FORWARD_MAX_RAW_BYTES:
+        pages = cards[candidate.tweet_id]
+        page_sizes = [_card_size(path) for path in pages]
+        if not pages or any(
+            size <= 0 or size > TAGFETCH_CARD_FORWARD_MAX_RAW_BYTES
+            for size in page_sizes
+        ):
             logger.warning(
                 "[TagfetchBroadcast] direct card exceeds safe limit group={} "
                 "tweet={} bytes={} limit_bytes={}",
                 group_id,
                 candidate.tweet_id,
-                image_size,
+                page_sizes,
                 TAGFETCH_CARD_FORWARD_MAX_RAW_BYTES,
             )
             return []
-        image = await asyncio.to_thread(
-            image_segment_from_path, cards[candidate.tweet_id]
-        )
-        if image is None:
-            return []
-        try:
-            await bot.call_api("send_group_msg", group_id=int(group_id), message=image)
-        except Exception:  # noqa: BLE001 - adapter errors are isolated per group
-            logger.exception(
-                "[TagfetchBroadcast] direct card failed group={} tweet={}",
-                group_id,
-                candidate.tweet_id,
-            )
-            return []
+        for page_index, path in enumerate(pages, start=1):
+            image = await asyncio.to_thread(image_segment_from_path, path)
+            if image is None:
+                return []
+            try:
+                await bot.call_api(
+                    "send_group_msg", group_id=int(group_id), message=image
+                )
+            except Exception:  # noqa: BLE001 - adapter errors are isolated per group
+                logger.exception(
+                    "[TagfetchBroadcast] direct card failed group={} tweet={} "
+                    "page={}/{}",
+                    group_id,
+                    candidate.tweet_id,
+                    page_index,
+                    len(pages),
+                )
+                return []
+            if page_index < len(pages):
+                await asyncio.sleep(FORWARD_BATCH_DELAY_SECONDS)
         return [candidate]
 
     batches, skipped = _card_batches(available, cards)
     for candidate in skipped:
+        page_sizes = [_card_size(path) for path in cards[candidate.tweet_id]]
         logger.warning(
             "[TagfetchBroadcast] card skipped by safe limit group={} tweet={} "
             "bytes={} limit_bytes={}",
             group_id,
             candidate.tweet_id,
-            _card_size(cards[candidate.tweet_id]),
+            page_sizes,
             TAGFETCH_CARD_FORWARD_MAX_RAW_BYTES,
         )
     logger.info(
@@ -221,14 +245,12 @@ async def _send_cards(
         TAGFETCH_CARD_FORWARD_MAX_NODES,
         TAGFETCH_CARD_FORWARD_MAX_RAW_BYTES,
     )
-    delivered: list[PreparedCandidate] = []
+    delivered_pages: dict[str, int] = {}
     for batch_index, batch in enumerate(batches, start=1):
         nodes: list[dict] = []
         included: list[PreparedCandidate] = []
-        for candidate in batch:
-            node = await _card_node(
-                cards[candidate.tweet_id], candidate, str(bot.self_id)
-            )
+        for candidate, path in batch:
+            node = await _card_node(path, candidate, str(bot.self_id))
             if node is not None:
                 nodes.append(node)
                 included.append(candidate)
@@ -246,7 +268,10 @@ async def _send_cards(
                     batch_index,
                 )
             else:
-                delivered.extend(included)
+                for candidate in included:
+                    delivered_pages[candidate.tweet_id] = (
+                        delivered_pages.get(candidate.tweet_id, 0) + 1
+                    )
                 logger.info(
                     "[TagfetchBroadcast] cards batch sent group={} batch={}/{} "
                     "nodes={}",
@@ -257,7 +282,14 @@ async def _send_cards(
                 )
         if batch_index < len(batches):
             await asyncio.sleep(FORWARD_BATCH_DELAY_SECONDS)
-    return delivered
+    skipped_ids = {candidate.tweet_id for candidate in skipped}
+    return [
+        candidate
+        for candidate in available
+        if candidate.tweet_id not in skipped_ids
+        and delivered_pages.get(candidate.tweet_id, 0)
+        == len(cards[candidate.tweet_id])
+    ]
 
 
 _IMAGE_EXTENSIONS = {
@@ -451,7 +483,7 @@ async def _broadcast_to_groups(
     try:
         cards = await _render_cards(candidates)
     finally:
-        # Free Chromium before constructing large OneBot base64 payloads.
+        # Ensure no renderer child remains before constructing OneBot payloads.
         await shutdown_renderer()
     has_previous_group = False
     for group_id in group_ids:

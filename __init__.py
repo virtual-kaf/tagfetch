@@ -3,6 +3,8 @@
 from nonebot import get_driver
 
 try:
+    if not __package__:
+        raise ValueError("package context is unavailable")
     get_driver()
 except ValueError:
     __all__: list[str] = []
