@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from nonebot import logger
@@ -12,6 +13,9 @@ from nonebot import logger
 from ..config import (
     CARD_DIR,
     TAGFETCH_RENDER_BROWSER_MAX_USES,
+    TAGFETCH_RENDER_IMAGE_CONCURRENCY,
+    TAGFETCH_RENDER_IMAGE_MAX_BYTES,
+    TAGFETCH_RENDER_IMAGE_TIMEOUT,
     TAGFETCH_RENDER_JPEG_QUALITY,
     TAGFETCH_RENDER_TIMEOUT,
 )
@@ -27,14 +31,87 @@ _browser: Any = None
 _playwright: Any = None
 _browser_lock = asyncio.Lock()
 _render_gate = asyncio.Semaphore(1)
+_image_request_gate = asyncio.Semaphore(TAGFETCH_RENDER_IMAGE_CONCURRENCY)
 _browser_uses = 0
+_BROWSER_CLOSE_TIMEOUT_SECONDS = 5
+_CONTEXT_CLOSE_TIMEOUT_SECONDS = 3
+
+_TRANSPARENT_PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d4948445200000001000000010804000000b51c0c02"
+    "0000000b4944415478da6364f80f00010501012718e3660000000049454e44ae426082"
+)
+
+
+def _bounded_image_url(url: str) -> str:
+    """Ask Twitter's CDN for card-sized media instead of original files."""
+    parts = urlsplit(url)
+    if parts.hostname != "pbs.twimg.com" or not parts.path.startswith("/media/"):
+        return url
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query["name"] = "medium"
+    return urlunsplit(
+        (parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment)
+    )
+
+
+async def _fulfill_image_fallback(route) -> None:
+    """Resolve a failed image without leaving networkidle pending."""
+    try:
+        await route.fulfill(
+            status=200,
+            content_type="image/png",
+            body=_TRANSPARENT_PNG,
+        )
+    except Exception:  # noqa: BLE001 - page may already be closing
+        pass
 
 
 async def _allow_card_image_only(route) -> None:
-    if route.request.resource_type == "image":
-        await route.continue_()
-    else:
+    if route.request.resource_type != "image":
         await route.abort()
+        return
+
+    response = None
+    source_url = route.request.url
+    try:
+        async with _image_request_gate:
+            response = await route.fetch(
+                url=_bounded_image_url(source_url),
+                timeout=TAGFETCH_RENDER_IMAGE_TIMEOUT * 1000,
+                max_redirects=3,
+            )
+            content_type = response.headers.get("content-type", "")
+            raw_length = response.headers.get("content-length", "")
+            try:
+                content_length = int(raw_length)
+            except (TypeError, ValueError):
+                content_length = 0
+            if (
+                not response.ok
+                or not content_type.casefold().startswith("image/")
+                or content_length > TAGFETCH_RENDER_IMAGE_MAX_BYTES
+            ):
+                raise RuntimeError(
+                    f"unsafe image response status={response.status} "
+                    f"content_type={content_type!r} bytes={content_length}"
+                )
+            await route.fulfill(response=response)
+    except Exception as exc:  # noqa: BLE001 - one image degrades independently
+        parts = urlsplit(source_url)
+        label = f"{parts.netloc}{parts.path}"[:160]
+        reason = str(exc) if isinstance(exc, RuntimeError) else type(exc).__name__
+        logger.warning(
+            "[TagfetchRender] remote image degraded source={} reason={}",
+            label,
+            reason,
+        )
+        await _fulfill_image_fallback(route)
+    finally:
+        if response is not None:
+            try:
+                await response.dispose()
+            except Exception:  # noqa: BLE001 - response may already be gone
+                pass
 
 
 async def _close_browser(reason: str) -> None:
@@ -50,12 +127,22 @@ async def _close_browser(reason: str) -> None:
         logger.info("[TagfetchRender] releasing browser reason={}", reason)
     if browser is not None:
         try:
-            await browser.close()
+            await asyncio.wait_for(
+                browser.close(),
+                timeout=_BROWSER_CLOSE_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("[TagfetchRender] browser close timed out")
         except Exception as exc:  # noqa: BLE001 - browser may be disconnected
             logger.warning("[TagfetchRender] browser close failed error={}", exc)
     if playwright is not None:
         try:
-            await playwright.stop()
+            await asyncio.wait_for(
+                playwright.stop(),
+                timeout=_BROWSER_CLOSE_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("[TagfetchRender] Playwright stop timed out")
         except Exception as exc:  # noqa: BLE001 - driver may already be gone
             logger.warning("[TagfetchRender] Playwright stop failed error={}", exc)
 
@@ -100,9 +187,15 @@ async def _get_browser():
                     "--no-sandbox",
                     "--disable-setuid-sandbox",
                     "--disable-gpu",
+                    "--disable-dev-shm-usage",
                     "--disable-extensions",
                     "--disable-background-networking",
+                    "--disable-breakpad",
+                    "--disable-component-update",
                     "--disable-sync",
+                    "--renderer-process-limit=1",
+                    "--disk-cache-size=1",
+                    "--media-cache-size=1",
                     "--no-first-run",
                     "--no-default-browser-check",
                     "--mute-audio",
@@ -147,7 +240,12 @@ async def _render_once(html: str, output_path: Path, width: int) -> None:
     finally:
         if context is not None:
             try:
-                await context.close()
+                await asyncio.wait_for(
+                    context.close(),
+                    timeout=_CONTEXT_CLOSE_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("[TagfetchRender] browser context close timed out")
             except Exception as exc:  # noqa: BLE001 - context may be disconnected
                 logger.debug(
                     "[TagfetchRender] browser context close failed error={}", exc
