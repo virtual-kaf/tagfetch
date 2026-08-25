@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import tempfile
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import Bot
 
-from ..models import PreparedCandidate
+from ..config import (
+    MEDIA_CACHE_DIR,
+    TAGFETCH_ONEBOT_FORWARD_MAX_RAW_BYTES,
+)
+from ..models import DownloadedImage, PreparedCandidate
 from ..renderer import render_conversation_card
 from ..storage import (
     has_delivery,
@@ -22,6 +28,19 @@ from .image_sender import (
 )
 
 
+def _card_media_url(url: str) -> str:
+    """Request a card-sized pbs.twimg.com variant without touching QQ originals."""
+    parsed = urlsplit(url)
+    if (
+        parsed.scheme.casefold() != "https"
+        or (parsed.hostname or "").casefold() != "pbs.twimg.com"
+    ):
+        return url
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query["name"] = "medium"
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), ""))
+
+
 def conversation_without_avatars(candidate: PreparedCandidate):
     """Return an avatar-free renderer copy without mutating fetched data."""
     rendered = copy.deepcopy(candidate.conversation)
@@ -30,6 +49,9 @@ def conversation_without_avatars(candidate: PreparedCandidate):
         if item is not None:
             item.author.avatar_url = ""
             item.translated_text = ""
+            for media in item.media:
+                media.url = _card_media_url(media.url)
+                media.thumbnail_url = _card_media_url(media.thumbnail_url)
     if rendered.target is not None:
         # Keep generated card filenames private to Tagfetch.
         rendered.target.id = f"tagfetch_{candidate.tweet_id}"
@@ -76,8 +98,10 @@ async def _render_cards(
     return cards
 
 
-def _card_node(path: Path, candidate: PreparedCandidate, bot_id: str) -> dict | None:
-    content = image_cq_from_path(path)
+async def _card_node(
+    path: Path, candidate: PreparedCandidate, bot_id: str
+) -> dict | None:
+    content = await asyncio.to_thread(image_cq_from_path, path)
     if content is None:
         return None
     target = candidate.conversation.target
@@ -99,7 +123,9 @@ async def _send_cards(
         return []
     if len(available) == 1:
         candidate = available[0]
-        image = image_segment_from_path(cards[candidate.tweet_id])
+        image = await asyncio.to_thread(
+            image_segment_from_path, cards[candidate.tweet_id]
+        )
         if image is None:
             return []
         try:
@@ -116,7 +142,7 @@ async def _send_cards(
     nodes: list[dict] = []
     included: list[PreparedCandidate] = []
     for candidate in available:
-        node = _card_node(cards[candidate.tweet_id], candidate, str(bot.self_id))
+        node = await _card_node(cards[candidate.tweet_id], candidate, str(bot.self_id))
         if node is not None:
             nodes.append(node)
             included.append(candidate)
@@ -132,56 +158,178 @@ async def _send_cards(
     return included
 
 
+_IMAGE_EXTENSIONS = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+}
+
+
+def _original_size(image: DownloadedImage) -> int:
+    if image.local_path is not None:
+        try:
+            return image.local_path.stat().st_size
+        except OSError:
+            return 0
+    return len(image.data)
+
+
+def _original_batches(
+    originals: list[DownloadedImage],
+) -> list[list[DownloadedImage]]:
+    batches: list[list[DownloadedImage]] = []
+    batch: list[DownloadedImage] = []
+    batch_size = 0
+    for image in originals:
+        image_size = _original_size(image)
+        if image_size <= 0 or image_size > TAGFETCH_ONEBOT_FORWARD_MAX_RAW_BYTES:
+            return []
+        if batch and batch_size + image_size > TAGFETCH_ONEBOT_FORWARD_MAX_RAW_BYTES:
+            batches.append(batch)
+            batch = []
+            batch_size = 0
+        batch.append(image)
+        batch_size += image_size
+    if batch:
+        batches.append(batch)
+    return batches
+
+
+def _original_path(
+    image: DownloadedImage, directory: Path, position: int
+) -> Path | None:
+    if image.local_path is not None:
+        return image.local_path if image.local_path.is_file() else None
+    extension = _IMAGE_EXTENSIONS.get(image.mime_type, ".img")
+    path = directory / f"{position:03d}{extension}"
+    try:
+        path.write_bytes(image.data)
+    except OSError:
+        return None
+    return path
+
+
 async def _send_originals(
     bot: Bot, group_id: str, candidates: list[PreparedCandidate]
 ) -> bool:
     originals = [image for candidate in candidates for image in candidate.originals]
     if not originals:
         return True
+    batches = _original_batches(originals)
+    if not batches:
+        logger.warning(
+            "[TagfetchBroadcast] originals exceed safe forward batch group={} "
+            "limit_bytes={}",
+            group_id,
+            TAGFETCH_ONEBOT_FORWARD_MAX_RAW_BYTES,
+        )
+        return False
+    logger.info(
+        "[TagfetchBroadcast] originals split group={} images={} batches={} "
+        "batch_limit_bytes={}",
+        group_id,
+        len(originals),
+        len(batches),
+        TAGFETCH_ONEBOT_FORWARD_MAX_RAW_BYTES,
+    )
     with tempfile.TemporaryDirectory(prefix="tagfetch_originals_") as directory:
-        nodes: list[dict] = []
-        for position, image in enumerate(originals, start=1):
-            extension = {
-                "image/jpeg": ".jpg",
-                "image/png": ".png",
-                "image/webp": ".webp",
-                "image/gif": ".gif",
-            }.get(image.mime_type, ".img")
-            path = Path(directory) / f"{position:03d}{extension}"
-            path.write_bytes(image.data)
-            content = image_cq_from_path(path)
-            if content is None:
-                logger.warning(
-                    "[TagfetchBroadcast] failed to encode original group={} index={}",
+        temporary_directory = Path(directory)
+        position = 0
+        for batch_index, batch in enumerate(batches, start=1):
+            nodes: list[dict] = []
+            for image in batch:
+                position += 1
+                path = await asyncio.to_thread(
+                    _original_path, image, temporary_directory, position
+                )
+                content = (
+                    await asyncio.to_thread(image_cq_from_path, path)
+                    if path is not None
+                    else None
+                )
+                if content is None:
+                    logger.warning(
+                        "[TagfetchBroadcast] failed to encode original "
+                        "group={} index={}",
+                        group_id,
+                        position,
+                    )
+                    return False
+                nodes.append(
+                    {
+                        "type": "node",
+                        "data": {
+                            "name": (
+                                f"@{image.author_handle} 原图 {image.media_index + 1}"
+                            ),
+                            "uin": str(bot.self_id),
+                            "content": content,
+                        },
+                    }
+                )
+            try:
+                await bot.call_api(
+                    "send_group_forward_msg",
+                    group_id=int(group_id),
+                    messages=nodes,
+                )
+            except Exception:  # noqa: BLE001 - no per-image fallback by design
+                logger.exception(
+                    "[TagfetchBroadcast] originals batch failed group={} batch={}",
                     group_id,
-                    position,
+                    batch_index,
                 )
                 return False
-            nodes.append(
-                {
-                    "type": "node",
-                    "data": {
-                        "name": f"@{image.author_handle} 原图 {image.media_index + 1}",
-                        "uin": str(bot.self_id),
-                        "content": content,
-                    },
-                }
+            logger.info(
+                "[TagfetchBroadcast] originals batch sent group={} batch={}/{}",
+                group_id,
+                batch_index,
+                len(batches),
             )
-        try:
-            await bot.call_api(
-                "send_group_forward_msg",
-                group_id=int(group_id),
-                messages=nodes,
-            )
-        except Exception:  # noqa: BLE001 - album failure has no fallback by design
-            logger.exception(
-                "[TagfetchBroadcast] originals merge failed group={}", group_id
-            )
-            return False
     return True
 
 
-async def broadcast_to_groups(
+def _cleanup_spooled_originals(candidates: list[PreparedCandidate]) -> None:
+    cache_root = MEDIA_CACHE_DIR.resolve()
+    directories: set[Path] = set()
+    removed = 0
+    for candidate in candidates:
+        for image in candidate.originals:
+            if image.local_path is None:
+                continue
+            resolved = image.local_path.resolve()
+            try:
+                resolved.relative_to(cache_root)
+            except ValueError:
+                logger.warning(
+                    "[TagfetchBroadcast] refusing cleanup outside media cache path={}",
+                    resolved,
+                )
+                continue
+            directories.add(resolved.parent)
+            try:
+                resolved.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning(
+                    "[TagfetchBroadcast] original cleanup failed file={} error={}",
+                    resolved.name,
+                    exc,
+                )
+            else:
+                removed += 1
+    for directory in sorted(
+        directories, key=lambda path: len(path.parts), reverse=True
+    ):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+    if removed:
+        logger.info("[TagfetchBroadcast] spooled originals cleaned count={}", removed)
+
+
+async def _broadcast_to_groups(
     bot: Bot, candidates: list[PreparedCandidate], group_ids: list[str]
 ) -> None:
     if not candidates or not group_ids:
@@ -236,3 +384,13 @@ async def broadcast_to_groups(
             logger.exception(
                 "[TagfetchBroadcast] isolated group failure group={}", group_id
             )
+
+
+async def broadcast_to_groups(
+    bot: Bot, candidates: list[PreparedCandidate], group_ids: list[str]
+) -> None:
+    """Broadcast a round and always release its spooled original files."""
+    try:
+        await _broadcast_to_groups(bot, candidates, group_ids)
+    finally:
+        _cleanup_spooled_originals(candidates)

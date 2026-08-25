@@ -12,6 +12,7 @@ from nonebot import logger
 from ..config import (
     CARD_DIR,
     TAGFETCH_RENDER_BROWSER_MAX_USES,
+    TAGFETCH_RENDER_JPEG_QUALITY,
     TAGFETCH_RENDER_TIMEOUT,
 )
 from ..models.tweet import TweetConversation
@@ -105,6 +106,9 @@ async def _get_browser():
                     "--no-first-run",
                     "--no-default-browser-check",
                     "--mute-audio",
+                    "--renderer-process-limit=1",
+                    "--disk-cache-size=1",
+                    "--media-cache-size=1",
                 ],
             )
         except Exception:
@@ -118,13 +122,15 @@ async def _get_browser():
 
 async def _render_once(html: str, output_path: Path, width: int) -> None:
     browser = await _get_browser()
-    page = None
+    context = None
     try:
-        page = await browser.new_page(
+        context = await browser.new_context(
             viewport={"width": width, "height": 900},
             device_scale_factor=1,
             java_script_enabled=False,
+            service_workers="block",
         )
+        page = await context.new_page()
         await page.route("**/*", _allow_card_image_only)
         await page.set_content(
             html,
@@ -134,16 +140,24 @@ async def _render_once(html: str, output_path: Path, width: int) -> None:
         set_viewport_size = getattr(page, "set_viewport_size", None)
         if set_viewport_size is not None:
             await set_viewport_size({"width": width, "height": 1})
-        await page.screenshot(path=str(output_path), full_page=True, type="png")
+        await page.screenshot(
+            path=str(output_path),
+            full_page=True,
+            type="jpeg",
+            quality=TAGFETCH_RENDER_JPEG_QUALITY,
+            animations="disabled",
+        )
     finally:
-        if page is not None:
+        if context is not None:
             try:
-                await page.close()
-            except Exception as exc:  # noqa: BLE001 - page may be disconnected
-                logger.debug("[TagfetchRender] page close failed error={}", exc)
+                await context.close()
+            except Exception as exc:  # noqa: BLE001 - context may be disconnected
+                logger.debug(
+                    "[TagfetchRender] browser context close failed error={}", exc
+                )
 
 
-async def _html_to_png(html: str, output_path: Path, width: int = 650) -> None:
+async def _html_to_image(html: str, output_path: Path, width: int = 650) -> None:
     global _browser_uses
     async with _render_gate:
         try:
@@ -180,8 +194,8 @@ async def render_conversation_card(conversation: TweetConversation) -> list[Path
         logger.warning("[TagfetchRender] missing target")
         return []
     try:
-        path = CARD_DIR / f"{conversation.target.id}.png"
-        await _html_to_png(_render_conversation_html(conversation), path)
+        path = CARD_DIR / f"{conversation.target.id}.jpg"
+        await _html_to_image(_render_conversation_html(conversation), path)
         logger.info("[TagfetchRender] card ready path={}", path)
         return [path]
     except Exception:  # noqa: BLE001 - caller skips a failed candidate

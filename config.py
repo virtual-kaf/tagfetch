@@ -21,6 +21,7 @@ PLUGIN_DIR = Path(__file__).resolve().parent
 DATA_DIR = PLUGIN_DIR / "data"
 STATE_DB = DATA_DIR / "tagfetch_state.sqlite3"
 CARD_DIR = DATA_DIR / "cards"
+MEDIA_CACHE_DIR = DATA_DIR / "media_cache"
 
 MIN_LIKES = 300
 LOOKBACK_HOURS = 2
@@ -153,7 +154,16 @@ def parse_id_set(raw: object) -> frozenset[int]:
 
 TAGFETCH_RENDER_TIMEOUT = _get_config_int("KABUBU_TAGFETCH_RENDER_TIMEOUT", 90, 30, 180)
 TAGFETCH_RENDER_BROWSER_MAX_USES = _get_config_int(
-    "KABUBU_TAGFETCH_RENDER_BROWSER_MAX_USES", 20, 1, 100
+    "KABUBU_TAGFETCH_RENDER_BROWSER_MAX_USES", 1, 1, 100
+)
+TAGFETCH_RENDER_JPEG_QUALITY = _get_config_int(
+    "KABUBU_TAGFETCH_RENDER_JPEG_QUALITY", 82, 60, 95
+)
+TAGFETCH_ONEBOT_FORWARD_MAX_RAW_BYTES = _get_config_int(
+    "KABUBU_TAGFETCH_ONEBOT_FORWARD_MAX_RAW_BYTES",
+    20 * 1024 * 1024,
+    1024 * 1024,
+    60 * 1024 * 1024,
 )
 ADMIN_IDS = parse_id_set(_get_config_value("KABUBU_ADMIN_LIST", []))
 SUPER_ADMIN_IDS = parse_id_set(_get_config_value("KABUBU_SUPER_ADMIN", []))

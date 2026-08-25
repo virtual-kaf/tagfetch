@@ -15,7 +15,11 @@ from ..config import FETCH_CONCURRENCY, LOOKBACK, MIN_LIKES
 from ..models import DiscoveredPost, PreparedCandidate
 from ..models.tweet import TweetConversation
 from ..storage import has_pending_delivery, is_rejected, record_rejection
-from .media import MediaDownloadError, download_candidate_images
+from .media import (
+    MediaDownloadError,
+    download_candidate_images,
+    spool_originals,
+)
 from .safety import review_candidate
 
 _HASHTAG_RE = re.compile(r"(?<![\w#])#([\w]+)", re.UNICODE)
@@ -221,12 +225,26 @@ async def run_tagfetch_pipeline(
             )
             continue
         logger.info("[TagfetchPipeline] candidate approved tweet={}", post.tweet_id)
+        try:
+            spooled_originals = await asyncio.to_thread(spool_originals, originals)
+        except MediaDownloadError as exc:
+            logger.warning(
+                "[TagfetchPipeline] approved original spool failed tweet={} reason={}",
+                post.tweet_id,
+                exc,
+            )
+            continue
+        logger.info(
+            "[TagfetchPipeline] originals moved to disk tweet={} count={}",
+            post.tweet_id,
+            len(spooled_originals),
+        )
         prepared.append(
             PreparedCandidate(
                 tweet_id=post.tweet_id,
                 url=post.url,
                 conversation=conversation,
-                originals=originals,
+                originals=spooled_originals,
             )
         )
     logger.info(

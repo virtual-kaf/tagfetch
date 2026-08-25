@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import base64
 import io
+import shutil
+import tempfile
 from collections.abc import Iterable
+from dataclasses import replace
+from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import httpx
@@ -13,6 +17,7 @@ from PIL import Image, ImageOps
 from ..config import (
     CANDIDATE_ORIGINALS_MAX_BYTES,
     GEMINI_IMAGE_PAYLOAD_MAX_BYTES,
+    MEDIA_CACHE_DIR,
     REQUEST_TIMEOUT_SECONDS,
     SINGLE_ORIGINAL_MAX_BYTES,
 )
@@ -25,6 +30,14 @@ _ALLOWED_IMAGE_TYPES = {
     "image/png": "image/png",
     "image/webp": "image/webp",
     "image/gif": "image/gif",
+}
+
+
+_IMAGE_EXTENSIONS = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
 }
 
 
@@ -206,6 +219,38 @@ async def download_candidate_images(
                     seen_thumbnails.add(media.thumbnail_url)
                     thumbnails.append(thumbnail)
     return originals, thumbnails
+
+
+def spool_originals(images: list[DownloadedImage]) -> list[DownloadedImage]:
+    """Persist approved QQ originals and release their in-memory byte payloads."""
+    if not images:
+        return []
+    MEDIA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        directory = Path(
+            tempfile.mkdtemp(prefix="candidate_", dir=str(MEDIA_CACHE_DIR))
+        )
+    except OSError as exc:
+        raise MediaDownloadError("original_spool_directory_failed") from exc
+
+    spooled: list[DownloadedImage] = []
+    try:
+        for position, image in enumerate(images, start=1):
+            if not image.data:
+                raise MediaDownloadError("original_spool_empty")
+            extension = _IMAGE_EXTENSIONS.get(image.mime_type, ".img")
+            path = directory / f"{position:03d}{extension}"
+            written = path.write_bytes(image.data)
+            if written != len(image.data):
+                raise MediaDownloadError("original_spool_incomplete")
+            spooled.append(replace(image, data=b"", local_path=path))
+    except OSError as exc:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise MediaDownloadError("original_spool_write_failed") from exc
+    except MediaDownloadError:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
+    return spooled
 
 
 def _encoded_size(images: Iterable[DownloadedImage]) -> int:

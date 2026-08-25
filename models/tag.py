@@ -1,6 +1,7 @@
 """Data structures used by the tagfetch pipeline."""
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from .tweet import TweetConversation
 
@@ -21,6 +22,7 @@ class DownloadedImage:
     author_handle: str
     media_index: int
     is_original_photo: bool = False
+    local_path: Path | None = None
 
 
 @dataclass
