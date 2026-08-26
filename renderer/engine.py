@@ -152,35 +152,57 @@ def _is_emoji_base(codepoint: int) -> bool:
 
 
 def _fallback_emoji_list(text: str) -> list[str]:
+    def consume_component(start: int) -> int | None:
+        codepoint = ord(text[start])
+        if text[start] in "#*0123456789":
+            end = start + 1
+            if end < len(text) and ord(text[end]) == 0xFE0F:
+                end += 1
+            if end < len(text) and ord(text[end]) == 0x20E3:
+                return end + 1
+            return None
+        if not _is_emoji_base(codepoint):
+            return None
+
+        end = start + 1
+        if end < len(text) and ord(text[end]) == 0xFE0E:
+            return None
+        if 0x1F1E6 <= codepoint <= 0x1F1FF:
+            if end < len(text) and 0x1F1E6 <= ord(text[end]) <= 0x1F1FF:
+                return end + 1
+            return end
+
+        while end < len(text) and (
+            ord(text[end]) == 0xFE0F
+            or 0x1F3FB <= ord(text[end]) <= 0x1F3FF
+        ):
+            end += 1
+
+        if codepoint == 0x1F3F4:
+            tag_start = end
+            while end < len(text) and 0xE0020 <= ord(text[end]) <= 0xE007E:
+                end += 1
+            if end > tag_start and end < len(text) and ord(text[end]) == 0xE007F:
+                end += 1
+            elif end > tag_start:
+                end = tag_start
+        return end
+
     found: list[str] = []
     index = 0
     while index < len(text):
-        codepoint = ord(text[index])
-        keycap = text[index] in "#*0123456789" and index + 1 < len(text)
-        if not _is_emoji_base(codepoint) and not keycap:
+        end = consume_component(index)
+        if end is None:
             index += 1
             continue
         start = index
-        index += 1
-        if (
-            0x1F1E6 <= codepoint <= 0x1F1FF
-            and index < len(text)
-            and 0x1F1E6 <= ord(text[index]) <= 0x1F1FF
-        ):
-            index += 1
-        while index < len(text):
-            next_codepoint = ord(text[index])
-            if (
-                next_codepoint in {0xFE0E, 0xFE0F, 0x20E3}
-                or 0x1F3FB <= next_codepoint <= 0x1F3FF
-            ):
-                index += 1
-                continue
-            if next_codepoint == 0x200D and index + 1 < len(text):
-                index += 2
-                continue
-            break
-        found.append(text[start:index])
+        while end < len(text) and ord(text[end]) == 0x200D:
+            next_end = consume_component(end + 1) if end + 1 < len(text) else None
+            if next_end is None:
+                break
+            end = next_end
+        found.append(text[start:end])
+        index = end
     return found
 
 
@@ -198,7 +220,15 @@ def _extract_emojis(texts: Iterable[str]) -> set[str]:
 
 
 def _twemoji_url(value: str) -> str:
-    codepoints = "-".join(f"{ord(char):x}" for char in value if ord(char) != 0xFE0F)
+    raw_codepoints = [ord(char) for char in value]
+    # Twemoji retains VS16 inside ZWJ graphemes (for example the rainbow flag)
+    # but drops it from standalone emoji and keycap filenames.
+    keep_vs16 = 0x200D in raw_codepoints
+    codepoints = "-".join(
+        f"{codepoint:x}"
+        for codepoint in raw_codepoints
+        if keep_vs16 or codepoint != 0xFE0F
+    )
     return f"https://cdn.jsdelivr.net/gh/jdecked/twemoji@latest/assets/72x72/{codepoints}.png"
 
 
@@ -343,7 +373,7 @@ async def _run_worker(spec: dict[str, Any]) -> list[Path]:
             await _terminate_process(process)
             raise
         if process.returncode != 0:
-            detail = stderr.decode("utf-8", errors="replace")[-2000:]
+            detail = stderr.decode("utf-8", errors="replace")[-12000:]
             raise RuntimeError(f"Pillow worker exited {process.returncode}: {detail}")
         if not result_path.exists():
             raise RuntimeError("Pillow worker produced no result manifest")
@@ -359,6 +389,11 @@ async def _run_worker(spec: dict[str, Any]) -> list[Path]:
         if stdout:
             logger.debug(
                 f"[Render] Pillow worker: {stdout.decode(errors='replace')[-1000:]}"
+            )
+        if stderr:
+            logger.debug(
+                f"[Render] Pillow worker diagnostics: "
+                f"{stderr.decode(errors='replace')[-12000:]}"
             )
         return paths
     finally:

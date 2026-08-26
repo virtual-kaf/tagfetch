@@ -13,6 +13,90 @@ import sys
 from pathlib import Path
 from typing import Any
 
+MAX_CANVAS_HEIGHT = 16_384
+MAX_CANVAS_PIXELS = 12_000_000
+
+
+class RenderSizeError(RuntimeError):
+    """Raised before an unsafe renderer allocation is attempted."""
+
+
+def _diagnostic(event: str, **fields: Any) -> None:
+    details = " ".join(f"{key}={value}" for key, value in fields.items())
+    print(f"[RenderSize] {event} {details}".rstrip(), file=sys.stderr, flush=True)
+
+
+def _pixels_to_pango(value: float, scale: int) -> int:
+    if scale <= 0:
+        raise RenderSizeError(f"invalid Pango.SCALE: {scale}")
+    return round(float(value) * scale)
+
+
+def _pango_to_pixels(value: float, scale: int) -> float:
+    if scale <= 0:
+        raise RenderSizeError(f"invalid Pango.SCALE: {scale}")
+    return float(value) / scale
+
+
+def _validate_size(
+    event: str, component: str, width: int, height: int, bytes_per_pixel: int
+) -> tuple[int, int]:
+    normalized_width = int(width)
+    normalized_height = int(height)
+    pixels = normalized_width * normalized_height
+    estimated_bytes = pixels * int(bytes_per_pixel)
+    _diagnostic(
+        event,
+        component=component,
+        width=normalized_width,
+        height=normalized_height,
+        pixels=pixels,
+        estimated_bytes=estimated_bytes,
+    )
+    if normalized_width <= 0 or normalized_height <= 0:
+        raise RenderSizeError(
+            f"invalid {component} dimensions: {normalized_width}x{normalized_height}"
+        )
+    if normalized_height > MAX_CANVAS_HEIGHT:
+        raise RenderSizeError(
+            f"{component} height {normalized_height} exceeds "
+            f"MAX_CANVAS_HEIGHT={MAX_CANVAS_HEIGHT}"
+        )
+    if pixels > MAX_CANVAS_PIXELS:
+        raise RenderSizeError(
+            f"{component} pixels {pixels} exceeds "
+            f"MAX_CANVAS_PIXELS={MAX_CANVAS_PIXELS}"
+        )
+    return normalized_width, normalized_height
+
+
+def _new_pillow_image(image, component: str, mode: str, size, color=0):
+    width, height = (int(size[0]), int(size[1]))
+    bytes_per_pixel = {"1": 1, "L": 1, "RGB": 3, "RGBA": 4}.get(mode, 4)
+    _validate_size("image-allocation", component, width, height, bytes_per_pixel)
+    try:
+        return image.new(mode, (width, height), color)
+    except MemoryError as exc:
+        raise RenderSizeError(
+            f"Pillow allocation failed for {component}: {width}x{height} {mode}"
+        ) from exc
+
+
+def _new_cairo_surface(cairo, component: str, width: int, height: int):
+    width, height = _validate_size(
+        "surface-allocation", component, width, height, 4
+    )
+    try:
+        return cairo.ImageSurface(cairo.FORMAT_ARGB32, width, height)
+    except MemoryError as exc:
+        raise RenderSizeError(
+            f"Cairo allocation failed for {component}: {width}x{height} ARGB32"
+        ) from exc
+
+
+def _measure_component(component: str, height: int, **fields: Any) -> None:
+    _diagnostic("component-measure", component=component, height=int(height), **fields)
+
 
 def _apply_memory_limit(megabytes: int) -> None:
     if sys.platform != "linux" or megabytes <= 0:
@@ -32,7 +116,7 @@ class _PangoFont:
         self.size = int(size)
 
     def getlength(self, value: str) -> float:
-        return float(self.backend.measure(value, self.size))
+        return float(self.backend.measure(value, self.size, "font.getlength"))
 
 
 class _PangoTextBackend:
@@ -75,7 +159,11 @@ class _PangoTextBackend:
         self._cairo = cairo
         self._Pango = Pango
         self._PangoCairo = PangoCairo
-        self._measure_surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, 1, 1)
+        self._pango_scale = int(Pango.SCALE)
+        if self._pango_scale <= 0:
+            raise RenderSizeError(f"invalid Pango.SCALE: {self._pango_scale}")
+        _diagnostic("pango-scale", value=self._pango_scale)
+        self._measure_surface = _new_cairo_surface(cairo, "pango.measure", 1, 1)
         self._measure_context = cairo.Context(self._measure_surface)
 
         try:
@@ -151,17 +239,29 @@ class _PangoTextBackend:
             index += len(matched)
         return "".join(result), slots
 
-    def _layout(self, text: str, size: int, max_width: int | None = None):
+    def _layout(
+        self,
+        text: str,
+        size: int,
+        max_width: int | None = None,
+        component: str = "text",
+    ):
         Pango = self._Pango
         prepared, slots = self._prepare_text(text)
         layout = self._PangoCairo.create_layout(self._measure_context)
         description = Pango.FontDescription()
         description.set_family(self.family)
-        description.set_absolute_size(int(size) * Pango.SCALE)
+        font_size_units = _pixels_to_pango(int(size), self._pango_scale)
+        description.set_absolute_size(font_size_units)
         layout.set_font_description(description)
         layout.set_auto_dir(True)
+        wrap_width_units = None
         if max_width is not None:
-            layout.set_width(max(1, int(max_width)) * Pango.SCALE)
+            wrap_width_pixels = max(1, int(max_width))
+            wrap_width_units = _pixels_to_pango(
+                wrap_width_pixels, self._pango_scale
+            )
+            layout.set_width(wrap_width_units)
             layout.set_wrap(Pango.WrapMode.WORD_CHAR)
         layout.set_text(prepared, -1)
 
@@ -175,14 +275,42 @@ class _PangoTextBackend:
             ink = Pango.Rectangle()
             logical = Pango.Rectangle()
             ink.x = logical.x = 0
-            ink.y = logical.y = -int(size) * Pango.SCALE
-            ink.width = logical.width = int(size) * Pango.SCALE
-            ink.height = logical.height = int(size) * Pango.SCALE
+            emoji_size_units = _pixels_to_pango(int(size), self._pango_scale)
+            ink.y = logical.y = -emoji_size_units
+            ink.width = logical.width = emoji_size_units
+            ink.height = logical.height = emoji_size_units
             shape = Pango.attr_shape_new(ink, logical)
             shape.start_index = byte_offset
             shape.end_index = byte_offset + replacement_bytes
             attributes.insert(shape)
         layout.set_attributes(attributes)
+        pixel_width, pixel_height = layout.get_pixel_size()
+        units_width, units_height = layout.get_size()
+        _diagnostic(
+            "pango-layout",
+            component=component,
+            text_bytes=len(prepared.encode("utf-8")),
+            font_px=int(size),
+            font_units=font_size_units,
+            wrap_px="none" if max_width is None else int(max_width),
+            wrap_units="none" if wrap_width_units is None else wrap_width_units,
+            scale=self._pango_scale,
+            pixel_width=int(pixel_width),
+            pixel_height=int(pixel_height),
+            units_width=int(units_width),
+            units_height=int(units_height),
+            units_height_px=round(
+                _pango_to_pixels(units_height, self._pango_scale), 3
+            ),
+            lines=int(layout.get_line_count()),
+        )
+        _validate_size(
+            "layout-measure",
+            component,
+            max(1, int(pixel_width)),
+            max(1, int(pixel_height)),
+            4,
+        )
         return layout, prepared, slots
 
     @staticmethod
@@ -196,11 +324,15 @@ class _PangoTextBackend:
                 restored = restored.replace("\ufffc", token, 1)
         return restored
 
-    def wrap(self, text: str, size: int, max_width: int) -> list[str]:
+    def wrap(
+        self, text: str, size: int, max_width: int, component: str = "text.wrap"
+    ) -> list[str]:
         if not text:
             return []
         normalized = text.replace("\t", " ")
-        layout, prepared, slots = self._layout(normalized, size, max_width)
+        layout, prepared, slots = self._layout(
+            normalized, size, max_width, component
+        )
         lines: list[str] = []
         for line in layout.get_lines_readonly():
             start = int(line.start_index)
@@ -208,17 +340,19 @@ class _PangoTextBackend:
             lines.append(self._restore_emojis(prepared, slots, start, end))
         return lines
 
-    def measure(self, text: str, size: int) -> int:
+    def measure(self, text: str, size: int, component: str = "text.measure") -> int:
         if not text:
             return 0
-        layout, _prepared, _slots = self._layout(text, size)
+        layout, _prepared, _slots = self._layout(text, size, component=component)
         _ink, logical = layout.get_pixel_extents()
         return max(1, int(logical.width))
 
-    def bbox(self, text: str, size: int) -> tuple[int, int, int, int]:
+    def bbox(
+        self, text: str, size: int, component: str = "text.bbox"
+    ) -> tuple[int, int, int, int]:
         if not text:
             return (0, 0, 0, 0)
-        layout, _prepared, _slots = self._layout(text, size)
+        layout, _prepared, _slots = self._layout(text, size, component=component)
         ink, logical = layout.get_pixel_extents()
         left = min(int(ink.x), int(logical.x))
         top = min(int(ink.y), int(logical.y))
@@ -227,13 +361,19 @@ class _PangoTextBackend:
         return left, top, right, bottom
 
     def unknown_glyphs(self, text: str, size: int = 24) -> int:
-        layout, _prepared, _slots = self._layout(text, size)
+        layout, _prepared, _slots = self._layout(
+            text, size, component="unknown-glyph-check"
+        )
         return int(layout.get_unknown_glyphs_count())
 
     def render(
-        self, text: str, size: int, fill: tuple[int, ...]
+        self,
+        text: str,
+        size: int,
+        fill: tuple[int, ...],
+        component: str = "text.render",
     ) -> tuple[Any, tuple[int, int], list[tuple[str, int, int]]]:
-        layout, _prepared, slots = self._layout(text, size)
+        layout, _prepared, slots = self._layout(text, size, component=component)
         ink, logical = layout.get_pixel_extents()
         left = min(0, int(ink.x), int(logical.x))
         top = min(0, int(ink.y), int(logical.y))
@@ -242,7 +382,9 @@ class _PangoTextBackend:
         width = max(1, right - left)
         height = max(1, bottom - top)
 
-        surface = self._cairo.ImageSurface(self._cairo.FORMAT_ARGB32, width, height)
+        surface = _new_cairo_surface(
+            self._cairo, f"{component}.surface", width, height
+        )
         context = self._cairo.Context(surface)
         context.move_to(-left, -top)
         red, green, blue = (int(value) / 255 for value in fill[:3])
@@ -263,10 +405,14 @@ class _PangoTextBackend:
         placements: list[tuple[str, int, int]] = []
         for byte_offset, token in slots:
             position = layout.index_to_pos(byte_offset)
-            slot_x = round(position.x / self._Pango.SCALE)
+            slot_x = round(_pango_to_pixels(position.x, self._pango_scale))
             slot_y = round(
-                position.y / self._Pango.SCALE
-                + max(0, position.height / self._Pango.SCALE - size) / 2
+                _pango_to_pixels(position.y, self._pango_scale)
+                + max(
+                    0,
+                    _pango_to_pixels(position.height, self._pango_scale) - size,
+                )
+                / 2
             )
             placements.append((token, slot_x, slot_y))
         return layer, (left, top), placements
@@ -292,8 +438,11 @@ def _run(spec: dict[str, Any]) -> list[str]:
             font_cache[normalized] = text_backend.font(normalized)
         return font_cache[normalized]
 
+    def new_image(component: str, mode: str, size, color=0):
+        return _new_pillow_image(Image, component, mode, size, color)
+
     def apply_rounded_corners(img: Image.Image, radius: int) -> Image.Image:
-        mask = Image.new("L", img.size, 0)
+        mask = new_image("media.rounded-mask", "L", img.size, 0)
         mask_draw = ImageDraw.Draw(mask)
         mask_draw.rounded_rectangle((0, 0, img.width - 1, img.height - 1), radius=radius, fill=255)
         res = img.convert("RGBA")
@@ -326,13 +475,22 @@ def _run(spec: dict[str, Any]) -> list[str]:
         def __getattr__(self, name: str):
             return getattr(self.pillow_draw, name)
 
-        def text(self, xy, value, *, font=None, fill=(0, 0, 0), **kwargs):
+        def text(
+            self,
+            xy,
+            value,
+            *,
+            font=None,
+            fill=(0, 0, 0),
+            component="text.render",
+            **kwargs,
+        ):
             if not isinstance(font, _PangoFont):
                 return self.pillow_draw.text(
                     xy, value, font=font, fill=fill, **kwargs
                 )
             layer, offset, placements = text_backend.render(
-                str(value), font.size, tuple(fill)
+                str(value), font.size, tuple(fill), str(component)
             )
             origin_x = round(float(xy[0]))
             origin_y = round(float(xy[1]))
@@ -357,10 +515,14 @@ def _run(spec: dict[str, Any]) -> list[str]:
                 )
             return None
 
-        def textbbox(self, xy, value, *, font=None, **kwargs):
+        def textbbox(
+            self, xy, value, *, font=None, component="text.bbox", **kwargs
+        ):
             if not isinstance(font, _PangoFont):
                 return self.pillow_draw.textbbox(xy, value, font=font, **kwargs)
-            left, top, right, bottom = text_backend.bbox(str(value), font.size)
+            left, top, right, bottom = text_backend.bbox(
+                str(value), font.size, str(component)
+            )
             origin_x = round(float(xy[0]))
             origin_y = round(float(xy[1]))
             return (
@@ -373,8 +535,13 @@ def _run(spec: dict[str, Any]) -> list[str]:
     def text_draw(image) -> PangoDraw:
         return PangoDraw(image)
 
-    def wrap(text: str, text_font: _PangoFont, max_width: int) -> list[str]:
-        return text_backend.wrap(text, text_font.size, max_width)
+    def wrap(
+        text: str,
+        text_font: _PangoFont,
+        max_width: int,
+        component: str = "text.wrap",
+    ) -> list[str]:
+        return text_backend.wrap(text, text_font.size, max_width, component)
 
     def draw_lines(
         image,
@@ -384,15 +551,31 @@ def _run(spec: dict[str, Any]) -> list[str]:
         text_font,
         fill: tuple[int, int, int],
         line_height: int,
+        component: str = "text.line",
     ) -> int:
         start_x, y = xy
         for line in lines:
-            draw.text((start_x, y), line, font=text_font, fill=fill)
+            draw.text(
+                (start_x, y),
+                line,
+                font=text_font,
+                fill=fill,
+                component=component,
+            )
             y += line_height
         return y
 
-    def draw_text(draw, xy, value: str, text_font, fill) -> None:
-        draw.text(xy, value, font=text_font, fill=fill)
+    def draw_text(
+        draw,
+        xy,
+        value: str,
+        text_font,
+        fill,
+        component: str = "text",
+    ) -> None:
+        draw.text(
+            xy, value, font=text_font, fill=fill, component=f"{component}.render"
+        )
 
     def rounded_avatar(path_value: str, size: int, fallback_text: str):
         avatar = None
@@ -407,11 +590,15 @@ def _run(spec: dict[str, Any]) -> list[str]:
             except (OSError, ValueError):
                 avatar = None
         if avatar is None:
-            avatar = Image.new("RGBA", (size, size), (225, 232, 238, 255))
+            avatar = new_image(
+                "avatar.placeholder", "RGBA", (size, size), (225, 232, 238, 255)
+            )
             avatar_draw = text_draw(avatar)
             avatar_font = font(max(18, size // 2))
             letter = (fallback_text.strip() or "?")[:1]
-            box = avatar_draw.textbbox((0, 0), letter, font=avatar_font)
+            box = avatar_draw.textbbox(
+                (0, 0), letter, font=avatar_font, component="avatar.initial"
+            )
             avatar_draw.text(
                 (
                     (size - (box[2] - box[0])) // 2,
@@ -420,8 +607,9 @@ def _run(spec: dict[str, Any]) -> list[str]:
                 letter,
                 font=avatar_font,
                 fill=(83, 100, 113),
+                component="avatar.initial",
             )
-        mask = Image.new("L", (size, size), 0)
+        mask = new_image("avatar.mask", "L", (size, size), 0)
         ImageDraw.Draw(mask).ellipse((0, 0, size - 1, size - 1), fill=255)
         avatar.putalpha(mask)
         return avatar
@@ -473,7 +661,12 @@ def _run(spec: dict[str, Any]) -> list[str]:
                 )
                 placeholder = "视频（请查看原文）" if item.get("video") else "图片加载失败"
                 placeholder_font = font(18)
-                lines = wrap(placeholder, placeholder_font, cell_width - 24)
+                lines = wrap(
+                    placeholder,
+                    placeholder_font,
+                    cell_width - 24,
+                    "media.placeholder",
+                )
                 text_height = len(lines) * 24
                 draw_lines(
                     image,
@@ -526,9 +719,21 @@ def _run(spec: dict[str, Any]) -> list[str]:
         trans_font = font(20)
         trans_line = 28
 
-        text_lines = wrap(str(item.get("text", "")), body_font, content_width)
+        item_key = str(item.get("id", "target" if target else "tweet"))[:40]
+        component_prefix = f"tweet[{item_key}]"
+        text_lines = wrap(
+            str(item.get("text", "")),
+            body_font,
+            content_width,
+            f"{component_prefix}.body",
+        )
         translation = str(item.get("translated_text", ""))
-        trans_lines = wrap(translation, trans_font, content_width - 32)
+        trans_lines = wrap(
+            translation,
+            trans_font,
+            content_width - 32,
+            f"{component_prefix}.translation",
+        )
         media = list(item.get("media", []))
         _, media_height, _ = media_layout(media, content_width)
 
@@ -536,13 +741,35 @@ def _run(spec: dict[str, Any]) -> list[str]:
         header_height = avatar_size
 
         height = padding + header_height + 16
+        _measure_component(
+            f"{component_prefix}.header", height, avatar_height=avatar_size
+        )
         if text_lines:
-            height += len(text_lines) * body_line + 12
+            body_height = len(text_lines) * body_line + 12
+            _measure_component(
+                f"{component_prefix}.body",
+                body_height,
+                lines=len(text_lines),
+                line_height=body_line,
+            )
+            height += body_height
 
         if trans_lines:
-            height += 28 + len(trans_lines) * trans_line + 20
+            translation_height = 28 + len(trans_lines) * trans_line + 20
+            _measure_component(
+                f"{component_prefix}.translation",
+                translation_height,
+                lines=len(trans_lines),
+                line_height=trans_line,
+            )
+            height += translation_height
 
         if media:
+            _measure_component(
+                f"{component_prefix}.media",
+                media_height + 16,
+                items=min(len(media), 9),
+            )
             height += media_height + 16
 
         quote_card = None
@@ -550,16 +777,33 @@ def _run(spec: dict[str, Any]) -> list[str]:
             quote_card, _ = render_tweet_card(
                 quote, width=content_width, target=False
             )
+            _measure_component(
+                f"{component_prefix}.quote", quote_card.height + 16
+            )
             height += quote_card.height + 16
 
+        _measure_component(f"{component_prefix}.stats", 36)
         height += 36
 
         if target and item.get("url"):
+            _measure_component(f"{component_prefix}.link", 36)
             height += 36
 
         height += padding
+        _measure_component(
+            f"{component_prefix}.total",
+            height,
+            width=width,
+            body_lines=len(text_lines),
+            translation_lines=len(trans_lines),
+        )
 
-        card = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        card = new_image(
+            f"{component_prefix}.canvas",
+            "RGBA",
+            (width, height),
+            (0, 0, 0, 0),
+        )
         draw = text_draw(card)
 
         draw.rounded_rectangle(
@@ -585,6 +829,7 @@ def _run(spec: dict[str, Any]) -> list[str]:
             str(item.get("name", "")),
             name_font,
             (15, 20, 25),
+            f"{component_prefix}.name",
         )
 
         handle = str(item.get("screen_name", ""))
@@ -599,6 +844,7 @@ def _run(spec: dict[str, Any]) -> list[str]:
             meta,
             muted_font,
             (83, 100, 113),
+            f"{component_prefix}.meta",
         )
 
         y += header_height + 14
@@ -614,6 +860,7 @@ def _run(spec: dict[str, Any]) -> list[str]:
                     body_font,
                     (15, 20, 25),
                     body_line,
+                    f"{component_prefix}.body-line",
                 )
                 safe_breaks.append(y)
             y += 12
@@ -648,6 +895,7 @@ def _run(spec: dict[str, Any]) -> list[str]:
                     trans_font,
                     (15, 20, 25),
                     trans_line,
+                    f"{component_prefix}.translation-line",
                 )
                 safe_breaks.append(y)
             y = box_top + box_height + 12
@@ -681,7 +929,12 @@ def _run(spec: dict[str, Any]) -> list[str]:
         cur_x = padding
         spacing = content_width // 4
         for icon_str, val_str in stats_items:
-            line_tokens = wrap(f"{icon_str} {val_str}", stats_font, spacing)
+            line_tokens = wrap(
+                f"{icon_str} {val_str}",
+                stats_font,
+                spacing,
+                f"{component_prefix}.stats-item",
+            )
             if line_tokens:
                 draw_lines(card, draw, [line_tokens[0]], (cur_x, y + 4), stats_font, (83, 100, 113), 24)
             cur_x += spacing
@@ -719,9 +972,25 @@ def _run(spec: dict[str, Any]) -> list[str]:
                 end = image.height
             if end <= start:
                 end = hard_end
-            crop = image.crop((0, start, image.width, end))
-            page = Image.new(
-                "RGB", (image.width, crop.height + footer_height), (245, 247, 248)
+            crop_height = end - start
+            _validate_size(
+                "image-allocation",
+                "pagination.crop",
+                image.width,
+                crop_height,
+                4,
+            )
+            try:
+                crop = image.crop((0, start, image.width, end))
+            except MemoryError as exc:
+                raise RenderSizeError(
+                    f"Pillow crop failed: {image.width}x{crop_height}"
+                ) from exc
+            page = new_image(
+                "pagination.page",
+                "RGB",
+                (image.width, crop.height + footer_height),
+                (245, 247, 248),
             )
             page.paste(crop, (0, 0))
             pages.append(page)
@@ -762,8 +1031,17 @@ def _run(spec: dict[str, Any]) -> list[str]:
         gap = 16
         total_height = 24 + badge_height + sum(block.height for block, _ in blocks)
         total_height += gap * (len(blocks) - 1) + 32
+        for index, (block, _) in enumerate(blocks):
+            _measure_component(
+                "conversation.block", block.height, index=index, width=block.width
+            )
+        _measure_component(
+            "conversation.canvas", total_height, blocks=len(blocks), width=width
+        )
 
-        canvas = Image.new("RGB", (width, total_height), (245, 247, 248))
+        canvas = new_image(
+            "conversation.canvas", "RGB", (width, total_height), (245, 247, 248)
+        )
         canvas_draw = text_draw(canvas)
         y = 20
 
@@ -815,7 +1093,14 @@ def _run(spec: dict[str, Any]) -> list[str]:
         height = 120 + sum(54 + len(values) * 36 for _, values, _ in visible)
         if not visible:
             height += 50
-        image = Image.new("RGB", (width, height), (245, 247, 248))
+        for title, values, _ in visible:
+            _measure_component(
+                "sublist.section", 54 + len(values) * 36, title=title, rows=len(values)
+            )
+        _measure_component("sublist.canvas", height, sections=len(visible))
+        image = new_image(
+            "sublist.canvas", "RGB", (width, height), (245, 247, 248)
+        )
         draw = text_draw(image)
         draw.rounded_rectangle(
             (24, 24, width - 24, height - 24),
@@ -842,12 +1127,24 @@ def _run(spec: dict[str, Any]) -> list[str]:
         width = 800
         title_font = font(32)
         member_font = font(22)
-        title_lines = wrap(str(spec.get("title", "")), title_font, width - 100)
+        title_lines = wrap(
+            str(spec.get("title", "")), title_font, width - 100, "live.title"
+        )
         member_lines = wrap(
-            "、".join(spec.get("members", [])), member_font, width - 100
+            "、".join(spec.get("members", [])),
+            member_font,
+            width - 100,
+            "live.members",
         )
         height = 210 + len(title_lines) * 44 + len(member_lines) * 32
-        image = Image.new("RGB", (width, height), (245, 247, 248))
+        _measure_component("live.title", len(title_lines) * 44, lines=len(title_lines))
+        _measure_component(
+            "live.members", len(member_lines) * 32, lines=len(member_lines)
+        )
+        _measure_component("live.canvas", height)
+        image = new_image(
+            "live.canvas", "RGB", (width, height), (245, 247, 248)
+        )
         draw = text_draw(image)
         draw.rounded_rectangle(
             (24, 24, width - 24, height - 24),
@@ -890,7 +1187,16 @@ def _run(spec: dict[str, Any]) -> list[str]:
             + row_height * len(weeks)
             + footer_height
         )
-        image = Image.new("RGB", (width, height), (245, 245, 243))
+        _measure_component("calendar.header", header_height)
+        _measure_component("calendar.weekdays", weekday_height)
+        _measure_component(
+            "calendar.weeks", row_height * len(weeks), rows=len(weeks)
+        )
+        _measure_component("calendar.footer", footer_height)
+        _measure_component("calendar.canvas", height, width=width)
+        image = new_image(
+            "calendar.canvas", "RGB", (width, height), (245, 245, 243)
+        )
         draw = text_draw(image)
         cal = spec.get("calendar", {})
         left, right = 26, width - 26
@@ -987,6 +1293,11 @@ def _run(spec: dict[str, Any]) -> list[str]:
                 event_y = y + 55
                 for event in events[:3]:
                     card_height = 68 if event.get("show_image") else 48
+                    _measure_component(
+                        "calendar.event-card",
+                        card_height,
+                        show_image=bool(event.get("show_image")),
+                    )
                     draw.rectangle(
                         (x1 + 9, event_y, x2 - 9, event_y + card_height),
                         fill=(237, 237, 237),
@@ -1017,7 +1328,10 @@ def _run(spec: dict[str, Any]) -> list[str]:
                         (76, 76, 76),
                     )
                     title_lines = wrap(
-                        str(event.get("title", "")), font(13), x2 - text_x - 15
+                        str(event.get("title", "")),
+                        font(13),
+                        x2 - text_x - 15,
+                        "calendar.event-title",
                     )[:2]
                     draw_lines(
                         image,
@@ -1102,6 +1416,13 @@ def main() -> int:
         )
         os.replace(temporary, result_path)
         return 0
+    except MemoryError:
+        print(
+            "RenderSizeError: renderer memory exhausted outside a guarded "
+            "allocation; inspect preceding [RenderSize] diagnostics",
+            file=sys.stderr,
+        )
+        return 1
     except Exception as exc:  # noqa: BLE001 - process boundary reports all errors
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
         return 1

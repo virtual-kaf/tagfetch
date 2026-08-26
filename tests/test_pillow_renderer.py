@@ -202,6 +202,49 @@ def test_tagfetch_render_spec_delegates_fallback_to_pango(tmp_path):
         assert category_font not in engine_source
 
 
+def test_tagfetch_twemoji_fallback_keeps_complete_graphemes():
+    values = engine._fallback_emoji_list(
+        "release * 6 of 9; *️⃣ 6️⃣ 9️⃣ 👨🏽‍💻 🏳️‍🌈 🇨🇳"
+    )
+
+    assert "*" not in values
+    assert "6" not in values
+    assert "9" not in values
+    assert {"*️⃣", "6️⃣", "9️⃣", "👨🏽‍💻", "🏳️‍🌈", "🇨🇳"} <= set(values)
+    assert engine._twemoji_url("*️⃣").endswith("/2a-20e3.png")
+    assert engine._twemoji_url("❤️").endswith("/2764.png")
+    assert engine._twemoji_url("🏳️‍🌈").endswith(
+        "/1f3f3-fe0f-200d-1f308.png"
+    )
+
+
+def test_tagfetch_renderer_size_budget_fails_before_allocation(capsys):
+    with pytest.raises(pillow_worker.RenderSizeError, match="MAX_CANVAS_HEIGHT"):
+        pillow_worker._validate_size(
+            "test", "too-tall", 800, pillow_worker.MAX_CANVAS_HEIGHT + 1, 4
+        )
+    with pytest.raises(pillow_worker.RenderSizeError, match="MAX_CANVAS_PIXELS"):
+        pillow_worker._validate_size(
+            "test", "too-many-pixels", pillow_worker.MAX_CANVAS_PIXELS + 1, 1, 4
+        )
+
+    diagnostics = capsys.readouterr().err
+    assert "width=800" in diagnostics
+    assert "estimated_bytes=" in diagnostics
+    assert pillow_worker._pixels_to_pango(688, 1024) == 688 * 1024
+    assert pillow_worker._pango_to_pixels(688 * 1024, 1024) == 688
+
+    class OutOfMemoryImage:
+        @staticmethod
+        def new(_mode, _size, _color):
+            raise MemoryError
+
+    with pytest.raises(pillow_worker.RenderSizeError, match="Pillow allocation"):
+        pillow_worker._new_pillow_image(
+            OutOfMemoryImage, "test.image", "RGB", (800, 100), "white"
+        )
+
+
 @requires_pango
 def test_tagfetch_pango_fontconfig_covers_mixed_scripts():
     backend = pillow_worker._PangoTextBackend(
@@ -210,6 +253,24 @@ def test_tagfetch_pango_fontconfig_covers_mixed_scripts():
     sample = "中文 Devanagari देवनागरी ગુજરાતી བོད་ཡིག ქართული ∑√∞ العربية"
 
     assert backend.unknown_glyphs(sample) == 0
+
+
+@requires_pango
+def test_tagfetch_pango_wrap_width_uses_pango_units_once():
+    backend = pillow_worker._PangoTextBackend(
+        engine.FONT_PATH, set(), Image, ImageFont
+    )
+    layout, _prepared, _slots = backend._layout(
+        "Pango width 中文 العربية " * 20,
+        21,
+        688,
+        "test.wrap-units",
+    )
+
+    assert layout.get_width() == 688 * backend._pango_scale
+    pixel_width, pixel_height = layout.get_pixel_size()
+    assert 0 < pixel_width <= 688
+    assert 0 < pixel_height < pillow_worker.MAX_CANVAS_HEIGHT
 
 
 @requires_pango
