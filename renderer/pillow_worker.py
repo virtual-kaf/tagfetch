@@ -1,6 +1,6 @@
 """Standalone Pillow renderer.
 
-This file is executed by path in a short-lived subprocess.  Keep it free of
+This file is executed by path in a short-lived subprocess. Keep it free of
 NoneBot and network imports: the parent process resolves every remote asset
 before starting the worker.
 """
@@ -23,7 +23,6 @@ def _apply_memory_limit(megabytes: int) -> None:
         limit = megabytes * 1024 * 1024
         resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
     except (ImportError, OSError, ValueError):
-        # Rendering still has the parent timeout and pixel limits as a backstop.
         pass
 
 
@@ -40,6 +39,14 @@ def _run(spec: dict[str, Any]) -> list[str]:
 
     def font(size: int):
         return ImageFont.truetype(str(font_path), size)
+
+    def apply_rounded_corners(img: Image.Image, radius: int) -> Image.Image:
+        mask = Image.new("L", img.size, 0)
+        mask_draw = ImageDraw.Draw(mask)
+        mask_draw.rounded_rectangle((0, 0, img.width - 1, img.height - 1), radius=radius, fill=255)
+        res = img.convert("RGBA")
+        res.putalpha(mask)
+        return res
 
     def emoji_image(token: str, size: int):
         cache_key = (token, size)
@@ -67,6 +74,7 @@ def _run(spec: dict[str, Any]) -> list[str]:
         values.sort(key=len, reverse=True)
 
     def tokens(text: str) -> list[str]:
+        """增强词块识别：避免英文单词被截断"""
         result: list[str] = []
         index = 0
         while index < len(text):
@@ -78,6 +86,11 @@ def _run(spec: dict[str, Any]) -> list[str]:
             if matched is not None:
                 result.append(matched)
                 index += len(matched)
+            elif text[index].isascii() and (text[index].isalnum() or text[index] in "'-_"):
+                start = index
+                while index < len(text) and text[index].isascii() and (text[index].isalnum() or text[index] in "'-_"):
+                    index += 1
+                result.append(text[start:index])
             else:
                 result.append(text[index])
                 index += 1
@@ -143,12 +156,6 @@ def _run(spec: dict[str, Any]) -> list[str]:
                         fill=(239, 243, 246),
                         outline=(160, 174, 184),
                     )
-                    draw.text(
-                        (x + size // 4, top - 1),
-                        "◇",
-                        font=text_font,
-                        fill=(83, 100, 113),
-                    )
                     x += size
                     continue
                 drawable = value.replace("\ufe0f", "").replace("\u200d", "")
@@ -198,10 +205,10 @@ def _run(spec: dict[str, Any]) -> list[str]:
         if count == 0:
             return [], 0, []
         cols = 1 if count == 1 else (2 if count in (2, 4) else 3)
-        gap = 4
+        gap = 6
         cell_width = (content_width - gap * (cols - 1)) // cols
         rows = (count + cols - 1) // cols
-        cell_height = min(520, int(cell_width * 0.72)) if count == 1 else cell_width
+        cell_height = min(480, int(cell_width * 0.75)) if count == 1 else cell_width
         return (
             display,
             rows * cell_height + (rows - 1) * gap,
@@ -213,7 +220,7 @@ def _run(spec: dict[str, Any]) -> list[str]:
 
     def draw_media_grid(image, draw, media, x: int, y: int, content_width: int):
         display, total_height, layout = media_layout(media, content_width)
-        gap = 4
+        gap = 6
         safe: list[int] = []
         for item, (col, row, cell_width, cell_height) in zip(display, layout):
             left = x + col * (cell_width + gap)
@@ -224,24 +231,23 @@ def _run(spec: dict[str, Any]) -> list[str]:
                 try:
                     with Image.open(path_value) as source:
                         rendered = ImageOps.fit(
-                            source.convert("RGB"),
+                            source.convert("RGBA"),
                             (cell_width, cell_height),
                             method=Image.Resampling.LANCZOS,
                         )
+                        rendered = apply_rounded_corners(rendered, 12)
                 except (OSError, ValueError):
                     rendered = None
             if rendered is None:
                 draw.rounded_rectangle(
                     (left, top, left + cell_width, top + cell_height),
-                    radius=8,
+                    radius=12,
                     fill=(239, 243, 246),
                 )
-                placeholder = (
-                    "视频（请查看原文）" if item.get("video") else "图片加载失败"
-                )
-                placeholder_font = font(20)
+                placeholder = "视频（请查看原文）" if item.get("video") else "图片加载失败"
+                placeholder_font = font(18)
                 lines = wrap(placeholder, placeholder_font, cell_width - 24)
-                text_height = len(lines) * 28
+                text_height = len(lines) * 24
                 draw_lines(
                     image,
                     draw,
@@ -249,12 +255,13 @@ def _run(spec: dict[str, Any]) -> list[str]:
                     (left + 12, top + (cell_height - text_height) // 2),
                     placeholder_font,
                     (83, 100, 113),
-                    28,
+                    24,
                 )
             else:
-                image.paste(rendered, (left, top))
+                image.paste(rendered, (left, top), rendered)
+
             if item.get("video"):
-                radius = max(20, min(42, cell_width // 8))
+                radius = max(20, min(36, cell_width // 8))
                 center = (left + cell_width // 2, top + cell_height // 2)
                 draw.ellipse(
                     (
@@ -263,7 +270,7 @@ def _run(spec: dict[str, Any]) -> list[str]:
                         center[0] + radius,
                         center[1] + radius,
                     ),
-                    fill=(0, 0, 0, 150),
+                    fill=(0, 0, 0, 160),
                 )
                 draw.polygon(
                     (
@@ -276,89 +283,99 @@ def _run(spec: dict[str, Any]) -> list[str]:
             safe.append(top + cell_height)
         return y + total_height, safe
 
-    def render_tweet(
+    def render_tweet_card(
         item: dict[str, Any],
         quote: dict[str, Any] | None = None,
-        width: int = 800,
-        nested: bool = False,
+        width: int = 736,
         target: bool = False,
     ):
-        padding = 22 if nested else 25
+        padding = 24
         content_width = width - padding * 2
-        body_font = font(22 if nested else 24)
-        body_line = 31 if nested else 34
-        muted_font = font(18 if nested else 20)
-        name_font = font(24 if nested else 28)
-        translation_font = font(21 if nested else 23)
-        translation_line = 30 if nested else 33
+
+        body_font = font(21)
+        body_line = 30
+        muted_font = font(18)
+        name_font = font(22)
+        trans_font = font(20)
+        trans_line = 28
+
         text_lines = wrap(str(item.get("text", "")), body_font, content_width)
         translation = str(item.get("translated_text", ""))
-        translation_lines = wrap(translation, translation_font, content_width - 24)
+        trans_lines = wrap(translation, trans_font, content_width - 32)
         media = list(item.get("media", []))
         _, media_height, _ = media_layout(media, content_width)
 
-        header_height = 62 if nested else 82
-        height = padding + header_height
-        height += len(text_lines) * body_line + (14 if text_lines else 0)
-        if translation_lines:
-            height += 28 + len(translation_lines) * translation_line + 20
+        avatar_size = 52
+        header_height = avatar_size
+
+        height = padding + header_height + 16
+        if text_lines:
+            height += len(text_lines) * body_line + 12
+
+        if trans_lines:
+            height += 28 + len(trans_lines) * trans_line + 20
+
         if media:
             height += media_height + 16
 
-        quote_image = None
-        quote_safe: list[int] = []
+        quote_card = None
         if quote:
-            quote_image, quote_safe = render_tweet(
-                quote,
-                width=content_width - 16,
-                nested=True,
-                target=False,
+            quote_card, _ = render_tweet_card(
+                quote, width=content_width, target=False
             )
-            height += quote_image.height + 28
-        if not nested:
-            height += 48
+            height += quote_card.height + 16
+
+        height += 36
+
         if target and item.get("url"):
-            height += 30
+            height += 36
+
         height += padding
 
-        background = (247, 247, 247) if nested else (255, 255, 255)
-        image = Image.new("RGB", (width, max(height, 180)), background)
-        draw = ImageDraw.Draw(image, "RGBA")
+        card = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(card)
+
+        draw.rounded_rectangle(
+            (0, 0, width - 1, height - 1),
+            radius=18,
+            fill=(255, 255, 255),
+            outline=(225, 232, 237),
+            width=1,
+        )
+
         safe_breaks: list[int] = []
         y = padding
 
-        avatar_size = 52 if nested else 68
         avatar = rounded_avatar(
             str(item.get("avatar_path", "")), avatar_size, str(item.get("name", ""))
         )
-        image.paste(avatar, (padding, y), avatar)
+        card.paste(avatar, (padding, y), avatar)
         text_x = padding + avatar_size + 14
+
         draw.text(
             (text_x, y + 2),
             str(item.get("name", "")),
             font=name_font,
-            fill=(0, 122, 255),
+            fill=(15, 20, 25),
         )
+
         handle = str(item.get("screen_name", ""))
-        created = str(item.get("created_at", ""))[:25]
+        created = str(item.get("created_at", ""))[:16]
         meta = f"@{handle}" if handle else ""
         if created:
-            meta = f"{meta}  ·  {created}" if meta else created
+            meta = f"{meta} · {created}" if meta else created
+
         draw.text(
-            (text_x, y + name_font.size + 7), meta, font=muted_font, fill=(83, 100, 113)
+            (text_x, y + name_font.size + 8), meta, font=muted_font, fill=(83, 100, 113)
         )
-        if not nested:
-            logo_font = font(34)
-            draw.text(
-                (width - padding - 28, y + 8), "X", font=logo_font, fill=(15, 20, 25)
-            )
-        y += header_height
+
+        y += header_height + 14
         safe_breaks.append(y)
 
         if text_lines:
             for line in text_lines:
                 y = draw_lines(
-                    image,
+                    card,
                     draw,
                     [line],
                     (padding, y),
@@ -367,81 +384,91 @@ def _run(spec: dict[str, Any]) -> list[str]:
                     body_line,
                 )
                 safe_breaks.append(y)
-            y += 14
+            y += 12
 
-        if translation_lines:
+        if trans_lines:
             box_top = y
-            box_height = 28 + len(translation_lines) * translation_line + 12
+            box_height = 28 + len(trans_lines) * trans_line + 16
             draw.rounded_rectangle(
                 (padding, box_top, width - padding, box_top + box_height),
                 radius=10,
-                fill=(235, 246, 255),
+                fill=(235, 245, 255),
             )
-            label_font = font(16 if nested else 18)
+            draw.rounded_rectangle(
+                (padding, box_top, padding + 4, box_top + box_height),
+                radius=2,
+                fill=(29, 155, 240),
+            )
+
             draw.text(
-                (padding + 12, y + 7), "翻译", font=label_font, fill=(0, 122, 255)
+                (padding + 16, y + 8),
+                "翻译自DEEPSEEK",
+                font=font(15),
+                fill=(29, 155, 240),
             )
-            y += 28
-            for line in translation_lines:
+            y += 30
+            for line in trans_lines:
                 y = draw_lines(
-                    image,
+                    card,
                     draw,
                     [line],
-                    (padding + 12, y),
-                    translation_font,
-                    (37, 72, 104),
-                    translation_line,
+                    (padding + 16, y),
+                    trans_font,
+                    (15, 20, 25),
+                    trans_line,
                 )
                 safe_breaks.append(y)
-            y = box_top + box_height + 8
+            y = box_top + box_height + 12
 
         if media:
             y, media_breaks = draw_media_grid(
-                image, draw, media, padding, y, content_width
+                card, draw, media, padding, y, content_width
             )
             safe_breaks.extend(media_breaks)
             y += 16
 
-        if quote_image is not None:
-            quote_x = padding + 8
-            draw.rounded_rectangle(
-                (padding, y, width - padding, y + quote_image.height + 16),
-                radius=12,
-                fill=(247, 247, 247),
-                outline=(220, 226, 230),
-                width=1,
-            )
-            image.paste(quote_image, (quote_x, y + 8))
-            safe_breaks.extend(y + 8 + value for value in quote_safe)
-            y += quote_image.height + 28
+        if quote_card is not None:
+            card.paste(quote_card, (padding, y), quote_card)
+            y += quote_card.height + 16
             safe_breaks.append(y)
 
-        if not nested:
-            stats_font = font(20)
-            stats = (
-                f"回复 {item.get('replies', 0)}     "
-                f"转推 {item.get('retweets', 0)}     "
-                f"喜欢 {item.get('likes', 0)}     "
-                f"浏览 {item.get('views', 0)}"
-            )
-            draw.line((padding, y, width - padding, y), fill=(225, 232, 237), width=1)
-            draw.text((padding, y + 13), stats, font=stats_font, fill=(83, 100, 113))
-            y += 48
-            safe_breaks.append(y)
-        if target and item.get("url"):
-            draw.text(
-                (padding, y),
-                "查看原文  " + str(item["url"]),
-                font=muted_font,
-                fill=(0, 122, 255),
-            )
-            y += 30
-            safe_breaks.append(y)
+        # 优化 Stats 栏：使用 draw_lines 绘制图标 + 文字组合
+        stats_font = font(18)
+        replies = item.get("replies", 0)
+        retweets = item.get("retweets", 0)
+        likes = item.get("likes", 0)
+        views = item.get("views", 0)
 
-        final_height = min(image.height, y + padding)
-        return image.crop((0, 0, width, final_height)), [
-            value for value in safe_breaks if 0 < value < final_height
+        stats_items = [
+            ("💬", str(replies)),
+            ("🔁", str(retweets)),
+            ("❤️", str(likes)),
+            ("👁", str(views)),
         ]
+        
+        cur_x = padding
+        spacing = content_width // 4
+        for icon_str, val_str in stats_items:
+            line_tokens = wrap(f"{icon_str} {val_str}", stats_font, spacing)
+            if line_tokens:
+                draw_lines(card, draw, [line_tokens[0]], (cur_x, y + 4), stats_font, (83, 100, 113), 24)
+            cur_x += spacing
+
+        y += 32
+        safe_breaks.append(y)
+
+        if target and item.get("url"):
+            link_font = font(18)
+            draw.text(
+                (width // 2 - 40, y + 2),
+                "查看原文",
+                font=link_font,
+                fill=(29, 155, 240),
+            )
+            y += 32
+            safe_breaks.append(y)
+
+        return card, safe_breaks
 
     def paginate(image, safe_breaks: list[int], max_height: int):
         if image.height <= max_height:
@@ -462,7 +489,7 @@ def _run(spec: dict[str, Any]) -> list[str]:
                 end = hard_end
             crop = image.crop((0, start, image.width, end))
             page = Image.new(
-                "RGB", (image.width, crop.height + footer_height), (255, 255, 255)
+                "RGB", (image.width, crop.height + footer_height), (245, 247, 248)
             )
             page.paste(crop, (0, 0))
             pages.append(page)
@@ -481,48 +508,72 @@ def _run(spec: dict[str, Any]) -> list[str]:
 
     def conversation_pages():
         width = 800
+        card_width = 736
+        card_x = (width - card_width) // 2
+
         blocks: list[tuple[Any, list[int]]] = []
         ancestors = list(spec.get("ancestors", []))
         for item in ancestors:
-            blocks.append(render_tweet(item, width=width))
+            blocks.append(render_tweet_card(item, width=card_width))
+
         target_item = spec["target"]
         blocks.append(
-            render_tweet(
+            render_tweet_card(
                 target_item,
                 quote=spec.get("quote"),
-                width=width,
+                width=card_width,
                 target=True,
             )
         )
-        label_height = 38 if ancestors else 0
-        gap = 14
-        total_height = 24 + label_height + sum(block.height for block, _ in blocks)
-        total_height += gap * max(0, len(blocks) - 1) + 24
-        canvas = Image.new("RGB", (width, total_height), (242, 244, 245))
+
+        badge_height = 40
+        gap = 16
+        total_height = 24 + badge_height + sum(block.height for block, _ in blocks)
+        total_height += gap * (len(blocks) - 1) + 32
+
+        canvas = Image.new("RGB", (width, total_height), (245, 247, 248))
         canvas_draw = ImageDraw.Draw(canvas)
-        y = 24
-        safe: list[int] = []
+        y = 20
+
         if ancestors:
-            label_font = font(19)
-            canvas_draw.text((25, y), "THREAD", font=label_font, fill=(83, 100, 113))
-            y += label_height
+            label_font = font(16)
+            badge_w, badge_h = 100, 28
+            bx = (width - badge_w) // 2
+            canvas_draw.rounded_rectangle(
+                (bx, y, bx + badge_w, y + badge_h), radius=14, fill=(232, 236, 239)
+            )
+            canvas_draw.text(
+                (bx + 20, y + 5), "THREAD", font=label_font, fill=(83, 100, 113)
+            )
+            y += badge_height
+
+        safe: list[int] = []
         for index, (block, block_safe) in enumerate(blocks):
-            canvas.paste(block, (0, y))
+            canvas.paste(block, (card_x, y), block)
             safe.extend(y + value for value in block_safe)
             y += block.height
             safe.append(y)
+
             if index < len(blocks) - 1:
-                y += gap
-                arrow_font = font(16)
-                canvas_draw.text(
-                    (30, y - 2), "↓ Reply", font=arrow_font, fill=(113, 118, 123)
+                y += gap // 2
+                badge_w, badge_h = 80, 26
+                bx = (width - badge_w) // 2
+                canvas_draw.rounded_rectangle(
+                    (bx, y - 13, bx + badge_w, y - 13 + badge_h),
+                    radius=13,
+                    fill=(232, 236, 239),
                 )
+                canvas_draw.text(
+                    (bx + 18, y - 9), "REPLY", font=font(14), fill=(83, 100, 113)
+                )
+                y += gap // 2
+
         return paginate(canvas, safe, int(spec.get("max_height", 4096)))
 
     def sublist_image():
         width = 800
         sections = [
-            ("核心成员（默认推送）", spec.get("active_core", []), (0, 122, 255)),
+            ("核心成员（默认推送）", spec.get("active_core", []), (29, 155, 240)),
             ("已屏蔽核心成员", spec.get("muted_core", []), (113, 118, 123)),
             ("额外订阅", spec.get("extra_subs", []), (0, 186, 124)),
         ]
@@ -532,54 +583,60 @@ def _run(spec: dict[str, Any]) -> list[str]:
         height = 120 + sum(54 + len(values) * 36 for _, values, _ in visible)
         if not visible:
             height += 50
-        image = Image.new("RGB", (width, height), (245, 247, 249))
+        image = Image.new("RGB", (width, height), (245, 247, 248))
         draw = ImageDraw.Draw(image)
         draw.rounded_rectangle(
-            (24, 24, width - 24, height - 24), radius=16, fill=(255, 255, 255)
+            (24, 24, width - 24, height - 24),
+            radius=18,
+            fill=(255, 255, 255),
+            outline=(225, 232, 237),
         )
-        draw.text((52, 48), "本群订阅", font=font(32), fill=(15, 20, 25))
+        draw.text((52, 48), "本群订阅", font=font(30), fill=(15, 20, 25))
         y = 102
         for title, values, color in visible:
             draw.text((52, y), title, font=font(22), fill=color)
             y += 38
             for value in values:
-                draw.text((72, y), f"@{value}", font=font(22), fill=(15, 20, 25))
+                draw.text((72, y), f"@{value}", font=font(20), fill=(15, 20, 25))
                 y += 36
             y += 16
         if not visible:
-            draw.text((52, y), "暂无订阅", font=font(22), fill=(113, 118, 123))
+            draw.text((52, y), "暂无订阅", font=font(20), fill=(113, 118, 123))
         return [image]
 
     def live_image():
         width = 800
-        title_font = font(34)
-        member_font = font(24)
+        title_font = font(32)
+        member_font = font(22)
         title_lines = wrap(str(spec.get("title", "")), title_font, width - 100)
         member_lines = wrap(
             "、".join(spec.get("members", [])), member_font, width - 100
         )
-        height = 210 + len(title_lines) * 47 + len(member_lines) * 34
-        image = Image.new("RGB", (width, height), (248, 249, 250))
+        height = 210 + len(title_lines) * 44 + len(member_lines) * 32
+        image = Image.new("RGB", (width, height), (245, 247, 248))
         draw = ImageDraw.Draw(image)
         draw.rounded_rectangle(
-            (24, 24, width - 24, height - 24), radius=18, fill=(255, 255, 255)
+            (24, 24, width - 24, height - 24),
+            radius=18,
+            fill=(255, 255, 255),
+            outline=(225, 232, 237),
         )
         draw.ellipse((52, 55, 78, 81), fill=(244, 33, 46))
-        draw.text((94, 48), "直播即将开始", font=font(25), fill=(244, 33, 46))
+        draw.text((94, 48), "直播即将开始", font=font(24), fill=(244, 33, 46))
         y = 105
-        y = draw_lines(image, draw, title_lines, (52, y), title_font, (15, 20, 25), 47)
+        y = draw_lines(image, draw, title_lines, (52, y), title_font, (15, 20, 25), 44)
         y += 14
         y = draw_lines(
-            image, draw, member_lines, (52, y), member_font, (83, 100, 113), 34
+            image, draw, member_lines, (52, y), member_font, (83, 100, 113), 32
         )
         y += 20
         draw.rounded_rectangle(
-            (52, y, width - 52, y + 50), radius=10, fill=(15, 20, 25)
+            (52, y, width - 52, y + 50), radius=12, fill=(15, 20, 25)
         )
         draw.text(
             (70, y + 10),
             str(spec.get("start_time_display", "")),
-            font=font(23),
+            font=font(22),
             fill=(255, 255, 255),
         )
         return [image]
