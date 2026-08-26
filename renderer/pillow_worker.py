@@ -98,6 +98,81 @@ def _measure_component(component: str, height: int, **fields: Any) -> None:
     _diagnostic("component-measure", component=component, height=int(height), **fields)
 
 
+def _draw_stats_icon(draw, kind: str, xy: tuple[int, int], color) -> None:
+    """Draw a compact X/Twitter-style outline action icon."""
+    x, y = xy
+    stroke = 2
+    if kind == "reply":
+        draw.rounded_rectangle(
+            (x + 1, y + 1, x + 18, y + 15),
+            radius=7,
+            outline=color,
+            width=stroke,
+        )
+        draw.line(
+            ((x + 6, y + 15), (x + 5, y + 19), (x + 10, y + 16)),
+            fill=color,
+            width=stroke,
+            joint="curve",
+        )
+        return
+    if kind == "repost":
+        draw.line(
+            ((x + 3, y + 10), (x + 3, y + 6), (x + 16, y + 6)),
+            fill=color,
+            width=stroke,
+            joint="curve",
+        )
+        draw.line(
+            ((x + 13, y + 3), (x + 16, y + 6), (x + 13, y + 9)),
+            fill=color,
+            width=stroke,
+            joint="curve",
+        )
+        draw.line(
+            ((x + 17, y + 10), (x + 17, y + 14), (x + 4, y + 14)),
+            fill=color,
+            width=stroke,
+            joint="curve",
+        )
+        draw.line(
+            ((x + 7, y + 11), (x + 4, y + 14), (x + 7, y + 17)),
+            fill=color,
+            width=stroke,
+            joint="curve",
+        )
+        return
+    if kind == "like":
+        points = (
+            (x + 10, y + 18),
+            (x + 7, y + 15),
+            (x + 3, y + 11),
+            (x + 2, y + 8),
+            (x + 3, y + 5),
+            (x + 5, y + 3),
+            (x + 8, y + 4),
+            (x + 10, y + 6),
+            (x + 12, y + 4),
+            (x + 15, y + 3),
+            (x + 17, y + 5),
+            (x + 18, y + 8),
+            (x + 17, y + 11),
+            (x + 13, y + 15),
+            (x + 10, y + 18),
+        )
+        draw.line(points, fill=color, width=stroke, joint="curve")
+        return
+    if kind == "views":
+        draw.line(
+            ((x + 2, y + 18), (x + 18, y + 18)), fill=color, width=stroke
+        )
+        draw.line(((x + 5, y + 18), (x + 5, y + 12)), fill=color, width=stroke)
+        draw.line(((x + 10, y + 18), (x + 10, y + 8)), fill=color, width=stroke)
+        draw.line(((x + 15, y + 18), (x + 15, y + 3)), fill=color, width=stroke)
+        return
+    raise ValueError(f"unsupported stats icon: {kind}")
+
+
 def _apply_memory_limit(megabytes: int) -> None:
     if sys.platform != "linux" or megabytes <= 0:
         return
@@ -912,31 +987,26 @@ def _run(spec: dict[str, Any]) -> list[str]:
             y += quote_card.height + 16
             safe_breaks.append(y)
 
-        # 优化 Stats 栏：使用 draw_lines 绘制图标 + 文字组合
         stats_font = font(18)
-        replies = item.get("replies", 0)
-        retweets = item.get("retweets", 0)
-        likes = item.get("likes", 0)
-        views = item.get("views", 0)
-
         stats_items = [
-            ("💬", str(replies)),
-            ("🔁", str(retweets)),
-            ("❤️", str(likes)),
-            ("👁", str(views)),
+            ("reply", str(item.get("replies", 0))),
+            ("repost", str(item.get("retweets", 0))),
+            ("like", str(item.get("likes", 0))),
+            ("views", str(item.get("views", 0))),
         ]
-        
+        stats_color = (83, 100, 113)
         cur_x = padding
         spacing = content_width // 4
-        for icon_str, val_str in stats_items:
-            line_tokens = wrap(
-                f"{icon_str} {val_str}",
+        for icon_kind, value in stats_items:
+            _draw_stats_icon(draw, icon_kind, (cur_x, y + 4), stats_color)
+            draw_text(
+                draw,
+                (cur_x + 28, y + 3),
+                value,
                 stats_font,
-                spacing,
-                f"{component_prefix}.stats-item",
+                stats_color,
+                f"{component_prefix}.stats-{icon_kind}",
             )
-            if line_tokens:
-                draw_lines(card, draw, [line_tokens[0]], (cur_x, y + 4), stats_font, (83, 100, 113), 24)
             cur_x += spacing
 
         y += 32

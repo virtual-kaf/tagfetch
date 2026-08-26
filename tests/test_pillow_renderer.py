@@ -9,7 +9,7 @@ from nonebot_plugin_tagfetch.models.tweet import (
 )
 from nonebot_plugin_tagfetch.renderer import engine, pillow_worker
 from nonebot_plugin_tagfetch.services import broadcaster
-from PIL import Image, ImageFont
+from PIL import Image, ImageDraw, ImageFont
 
 
 def _pango_runtime_available() -> bool:
@@ -243,6 +243,19 @@ def test_tagfetch_renderer_size_budget_fails_before_allocation(capsys):
         pillow_worker._new_pillow_image(
             OutOfMemoryImage, "test.image", "RGB", (800, 100), "white"
         )
+
+
+def test_tagfetch_stats_row_uses_twitter_style_outline_icons():
+    image = Image.new("L", (92, 24), 0)
+    draw = ImageDraw.Draw(image)
+
+    for index, kind in enumerate(("reply", "repost", "like", "views")):
+        pillow_worker._draw_stats_icon(draw, kind, (index * 23, 1), 255)
+        assert image.crop((index * 23, 0, index * 23 + 22, 24)).getbbox()
+
+    source = Path(pillow_worker.__file__).read_text(encoding="utf-8")
+    for old_icon in ('("💬"', '("🔁"', '("❤️"', '("👁"'):
+        assert old_icon not in source
 
 
 @requires_pango
