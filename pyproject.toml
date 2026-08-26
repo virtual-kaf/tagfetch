@@ -16,6 +16,8 @@ dependencies = [
     "aiohttp>=3.9.0",
     "Pillow>=10.0.0",
     "emoji>=2.10.0",
+    "pycairo==1.29.0",
+    "PyGObject==3.44.2",
 ]
 
 [project.optional-dependencies]

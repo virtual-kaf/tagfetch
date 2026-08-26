@@ -7,9 +7,28 @@ from nonebot_plugin_tagfetch.models.tweet import (
     TweetConversation,
     TweetItem,
 )
-from nonebot_plugin_tagfetch.renderer import engine
+from nonebot_plugin_tagfetch.renderer import engine, pillow_worker
 from nonebot_plugin_tagfetch.services import broadcaster
-from PIL import Image
+from PIL import Image, ImageFont
+
+
+def _pango_runtime_available() -> bool:
+    try:
+        import cairo  # noqa: F401
+        import gi
+
+        gi.require_version("Pango", "1.0")
+        gi.require_version("PangoCairo", "1.0")
+        from gi.repository import Pango, PangoCairo  # noqa: F401
+    except (ImportError, ValueError, OSError):
+        return False
+    return True
+
+
+requires_pango = pytest.mark.skipif(
+    not _pango_runtime_available(),
+    reason="PangoCairo/fontconfig integration tests require the target Linux runtime",
+)
 
 
 def _tweet(tweet_id: str, text: str = "原文") -> TweetItem:
@@ -48,6 +67,7 @@ def _worker_spec(tmp_path: Path, max_height: int = 4096) -> dict:
     }
 
 
+@requires_pango
 @pytest.mark.asyncio
 async def test_tagfetch_worker_outputs_paginated_jpeg(tmp_path, monkeypatch):
     monkeypatch.setattr(engine, "TEMP_DIR", tmp_path / "worker-temp")
@@ -161,3 +181,76 @@ def test_tagfetch_renderer_is_browser_free_and_independent():
     assert "playwright" not in source
     assert "jinja" not in source
     assert "nonebot_plugin_xfetch" not in source
+
+
+def test_tagfetch_render_spec_delegates_fallback_to_pango(tmp_path):
+    spec = engine._base_spec("conversation", tmp_path / "card.jpg", {})
+
+    assert spec["font_path"] == str(engine.FONT_PATH)
+    assert "fallback_font_paths" not in spec
+    assert not hasattr(engine, "FALLBACK_FONT_PATHS")
+
+    renderer_source = Path(pillow_worker.__file__).read_text(encoding="utf-8")
+    engine_source = Path(engine.__file__).read_text(encoding="utf-8")
+    for category_font in (
+        "NotoSansMath-Regular.ttf",
+        "NotoSansGujarati-Regular.ttf",
+        "NotoSerifTibetan-Regular.ttf",
+        "NotoSansGeorgian-Regular.ttf",
+    ):
+        assert category_font not in renderer_source
+        assert category_font not in engine_source
+
+
+@requires_pango
+def test_tagfetch_pango_fontconfig_covers_mixed_scripts():
+    backend = pillow_worker._PangoTextBackend(
+        engine.FONT_PATH, set(), Image, ImageFont
+    )
+    sample = "中文 Devanagari देवनागरी ગુજરાતી བོད་ཡིག ქართული ∑√∞ العربية"
+
+    assert backend.unknown_glyphs(sample) == 0
+
+
+@requires_pango
+@pytest.mark.asyncio
+async def test_tagfetch_pango_renders_mixed_scripts_as_jpeg(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(engine, "TEMP_DIR", tmp_path / "worker-temp")
+    spec = _worker_spec(tmp_path)
+    spec["output_path"] = str(tmp_path / "pango-mixed.jpg")
+    spec["target"]["name"] = "明透 ქართული"
+    spec["target"]["text"] = (
+        "देवनागरी ગુજરાતી བོད་ཡིག ქართული ∑√∞ العربية"
+    )
+
+    output_path = (await engine._run_worker(spec))[0]
+
+    with Image.open(output_path) as rendered:
+        assert rendered.format == "JPEG"
+        assert rendered.width == 800
+        assert rendered.height <= spec["max_height"]
+
+
+def test_tagfetch_alinux3_installer_pins_runtime_and_font_packages():
+    source = (
+        Path(__file__).parents[1]
+        / "tools"
+        / "install_alinux3_renderer_deps.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "pycairo==1.29.0" in source
+    assert "PyGObject==3.44.2" in source
+    for package in (
+        "pango",
+        "cairo-gobject",
+        "gobject-introspection",
+        "google-noto-sans-devanagari-fonts",
+        "google-noto-sans-gujarati-fonts",
+        "google-noto-sans-tibetan-fonts",
+        "google-noto-sans-georgian-fonts",
+        "google-noto-sans-symbols-fonts",
+        "stix-math-fonts",
+    ):
+        assert package in source

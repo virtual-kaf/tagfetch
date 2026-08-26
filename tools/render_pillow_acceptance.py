@@ -1,4 +1,4 @@
-"""Generate the untranslated Tagfetch Pillow acceptance card for Sooda."""
+"""Generate the untranslated Tagfetch Pillow acceptance card for ASU."""
 
 from __future__ import annotations
 
@@ -11,8 +11,8 @@ from nonebot_plugin_tagfetch.models import PreparedCandidate
 from nonebot_plugin_tagfetch.renderer import engine as renderer
 from nonebot_plugin_tagfetch.services.broadcaster import conversation_without_avatars
 
-TWEET_ID = "2090751763116863742"
-TWEET_URL = f"https://x.com/sooda_oda/status/{TWEET_ID}"
+TWEET_ID = "2091513722498105515"
+TWEET_URL = f"https://x.com/asu_virtual/status/{TWEET_ID}"
 
 
 def _use_acceptance_directories(root: Path) -> None:

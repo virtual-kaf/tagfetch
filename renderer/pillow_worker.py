@@ -26,6 +26,252 @@ def _apply_memory_limit(megabytes: int) -> None:
         pass
 
 
+class _PangoFont:
+    def __init__(self, backend: _PangoTextBackend, size: int) -> None:
+        self.backend = backend
+        self.size = int(size)
+
+    def getlength(self, value: str) -> float:
+        return float(self.backend.measure(value, self.size))
+
+
+class _PangoTextBackend:
+    """Shape and rasterize text with PangoCairo and fontconfig."""
+
+    _OBJECT_REPLACEMENT = "\ufffc"
+
+    def __init__(self, font_path: Path, known_emojis: set[str], image, image_font) -> None:
+        self._Image = image
+        self._known_emojis = known_emojis
+        self._emoji_by_first: dict[str, list[str]] = {}
+        for value in known_emojis:
+            if value:
+                self._emoji_by_first.setdefault(value[0], []).append(value)
+        for values in self._emoji_by_first.values():
+            values.sort(key=len, reverse=True)
+
+        try:
+            import cairo
+            import gi
+
+            gi.require_version("Pango", "1.0")
+            gi.require_version("PangoCairo", "1.0")
+            from gi.repository import Pango, PangoCairo
+        except (ImportError, ValueError, OSError) as exc:
+            raise RuntimeError(
+                "Pango renderer unavailable; install cairo, pango, "
+                "gobject-introspection, pycairo, and PyGObject"
+            ) from exc
+
+        if not font_path.is_file():
+            raise RuntimeError(f"bundled renderer font missing: {font_path}")
+        try:
+            primary_font = image_font.truetype(str(font_path), 16)
+            self.family = str(primary_font.getname()[0])
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"unable to load bundled renderer font: {font_path}") from exc
+
+        self._register_fontconfig_font(font_path)
+        self._cairo = cairo
+        self._Pango = Pango
+        self._PangoCairo = PangoCairo
+        self._measure_surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, 1, 1)
+        self._measure_context = cairo.Context(self._measure_surface)
+
+        try:
+            font_map = PangoCairo.FontMap.get_default()
+            font_map.changed()
+            families = {family.get_name().casefold() for family in font_map.list_families()}
+        except (AttributeError, TypeError) as exc:
+            raise RuntimeError("unable to initialize the PangoCairo font map") from exc
+        if self.family.casefold() not in families:
+            raise RuntimeError(
+                f"fontconfig did not register bundled renderer font family {self.family!r}"
+            )
+
+    @staticmethod
+    def _register_fontconfig_font(font_path: Path) -> None:
+        import ctypes
+        import ctypes.util
+
+        library_name = ctypes.util.find_library("fontconfig")
+        if not library_name:
+            raise RuntimeError("fontconfig shared library not found")
+        try:
+            fontconfig = ctypes.CDLL(library_name)
+            fontconfig.FcInit.argtypes = []
+            fontconfig.FcInit.restype = ctypes.c_int
+            fontconfig.FcConfigGetCurrent.argtypes = []
+            fontconfig.FcConfigGetCurrent.restype = ctypes.c_void_p
+            fontconfig.FcConfigAppFontAddFile.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_char_p,
+            ]
+            fontconfig.FcConfigAppFontAddFile.restype = ctypes.c_int
+            fontconfig.FcConfigBuildFonts.argtypes = [ctypes.c_void_p]
+            fontconfig.FcConfigBuildFonts.restype = ctypes.c_int
+        except (AttributeError, OSError) as exc:
+            raise RuntimeError("fontconfig application-font API unavailable") from exc
+        if not fontconfig.FcInit():
+            raise RuntimeError("fontconfig initialization failed")
+        config = fontconfig.FcConfigGetCurrent()
+        if not config:
+            raise RuntimeError("fontconfig returned no current configuration")
+        encoded_path = os.fsencode(font_path.resolve())
+        if not fontconfig.FcConfigAppFontAddFile(config, encoded_path):
+            raise RuntimeError(f"fontconfig rejected bundled font: {font_path}")
+        if not fontconfig.FcConfigBuildFonts(config):
+            raise RuntimeError("fontconfig failed to rebuild its application font set")
+
+    def font(self, size: int) -> _PangoFont:
+        return _PangoFont(self, size)
+
+    def _prepare_text(
+        self, text: str
+    ) -> tuple[str, list[tuple[int, str]]]:
+        result: list[str] = []
+        slots: list[tuple[int, str]] = []
+        byte_offset = 0
+        index = 0
+        while index < len(text):
+            matched = None
+            for candidate in self._emoji_by_first.get(text[index], ()):
+                if text.startswith(candidate, index):
+                    matched = candidate
+                    break
+            if matched is None:
+                value = text[index]
+                result.append(value)
+                byte_offset += len(value.encode("utf-8"))
+                index += 1
+                continue
+            result.append(self._OBJECT_REPLACEMENT)
+            slots.append((byte_offset, matched))
+            byte_offset += len(self._OBJECT_REPLACEMENT.encode("utf-8"))
+            index += len(matched)
+        return "".join(result), slots
+
+    def _layout(self, text: str, size: int, max_width: int | None = None):
+        Pango = self._Pango
+        prepared, slots = self._prepare_text(text)
+        layout = self._PangoCairo.create_layout(self._measure_context)
+        description = Pango.FontDescription()
+        description.set_family(self.family)
+        description.set_absolute_size(int(size) * Pango.SCALE)
+        layout.set_font_description(description)
+        layout.set_auto_dir(True)
+        if max_width is not None:
+            layout.set_width(max(1, int(max_width)) * Pango.SCALE)
+            layout.set_wrap(Pango.WrapMode.WORD_CHAR)
+        layout.set_text(prepared, -1)
+
+        attributes = Pango.AttrList()
+        fallback = Pango.attr_fallback_new(True)
+        fallback.start_index = 0
+        fallback.end_index = 0xFFFFFFFF
+        attributes.insert(fallback)
+        replacement_bytes = len(self._OBJECT_REPLACEMENT.encode("utf-8"))
+        for byte_offset, _token in slots:
+            ink = Pango.Rectangle()
+            logical = Pango.Rectangle()
+            ink.x = logical.x = 0
+            ink.y = logical.y = -int(size) * Pango.SCALE
+            ink.width = logical.width = int(size) * Pango.SCALE
+            ink.height = logical.height = int(size) * Pango.SCALE
+            shape = Pango.attr_shape_new(ink, logical)
+            shape.start_index = byte_offset
+            shape.end_index = byte_offset + replacement_bytes
+            attributes.insert(shape)
+        layout.set_attributes(attributes)
+        return layout, prepared, slots
+
+    @staticmethod
+    def _restore_emojis(
+        prepared: str, slots: list[tuple[int, str]], start: int, end: int
+    ) -> str:
+        raw = prepared.encode("utf-8")
+        restored = raw[start:end].decode("utf-8")
+        for byte_offset, token in slots:
+            if start <= byte_offset < end:
+                restored = restored.replace("\ufffc", token, 1)
+        return restored
+
+    def wrap(self, text: str, size: int, max_width: int) -> list[str]:
+        if not text:
+            return []
+        normalized = text.replace("\t", " ")
+        layout, prepared, slots = self._layout(normalized, size, max_width)
+        lines: list[str] = []
+        for line in layout.get_lines_readonly():
+            start = int(line.start_index)
+            end = start + int(line.length)
+            lines.append(self._restore_emojis(prepared, slots, start, end))
+        return lines
+
+    def measure(self, text: str, size: int) -> int:
+        if not text:
+            return 0
+        layout, _prepared, _slots = self._layout(text, size)
+        _ink, logical = layout.get_pixel_extents()
+        return max(1, int(logical.width))
+
+    def bbox(self, text: str, size: int) -> tuple[int, int, int, int]:
+        if not text:
+            return (0, 0, 0, 0)
+        layout, _prepared, _slots = self._layout(text, size)
+        ink, logical = layout.get_pixel_extents()
+        left = min(int(ink.x), int(logical.x))
+        top = min(int(ink.y), int(logical.y))
+        right = max(int(ink.x + ink.width), int(logical.x + logical.width))
+        bottom = max(int(ink.y + ink.height), int(logical.y + logical.height))
+        return left, top, right, bottom
+
+    def unknown_glyphs(self, text: str, size: int = 24) -> int:
+        layout, _prepared, _slots = self._layout(text, size)
+        return int(layout.get_unknown_glyphs_count())
+
+    def render(
+        self, text: str, size: int, fill: tuple[int, ...]
+    ) -> tuple[Any, tuple[int, int], list[tuple[str, int, int]]]:
+        layout, _prepared, slots = self._layout(text, size)
+        ink, logical = layout.get_pixel_extents()
+        left = min(0, int(ink.x), int(logical.x))
+        top = min(0, int(ink.y), int(logical.y))
+        right = max(1, int(ink.x + ink.width), int(logical.x + logical.width))
+        bottom = max(1, int(ink.y + ink.height), int(logical.y + logical.height))
+        width = max(1, right - left)
+        height = max(1, bottom - top)
+
+        surface = self._cairo.ImageSurface(self._cairo.FORMAT_ARGB32, width, height)
+        context = self._cairo.Context(surface)
+        context.move_to(-left, -top)
+        red, green, blue = (int(value) / 255 for value in fill[:3])
+        alpha = int(fill[3]) / 255 if len(fill) > 3 else 1.0
+        context.set_source_rgba(red, green, blue, alpha)
+        self._PangoCairo.show_layout(context, layout)
+        surface.flush()
+        layer = self._Image.frombuffer(
+            "RGBa",
+            (width, height),
+            bytes(surface.get_data()),
+            "raw",
+            "BGRa",
+            surface.get_stride(),
+            1,
+        ).convert("RGBA")
+
+        placements: list[tuple[str, int, int]] = []
+        for byte_offset, token in slots:
+            position = layout.index_to_pos(byte_offset)
+            slot_x = round(position.x / self._Pango.SCALE)
+            slot_y = round(
+                position.y / self._Pango.SCALE
+                + max(0, position.height / self._Pango.SCALE - size) / 2
+            )
+            placements.append((token, slot_x, slot_y))
+        return layer, (left, top), placements
+
+
 def _run(spec: dict[str, Any]) -> list[str]:
     from PIL import Image, ImageDraw, ImageFont, ImageOps
 
@@ -37,8 +283,14 @@ def _run(spec: dict[str, Any]) -> list[str]:
     emoji_paths = {key: Path(value) for key, value in raw_emoji_paths.items() if value}
     emoji_cache: dict[tuple[str, int], Any] = {}
 
-    def font(size: int):
-        return ImageFont.truetype(str(font_path), size)
+    text_backend = _PangoTextBackend(font_path, known_emojis, Image, ImageFont)
+    font_cache: dict[int, _PangoFont] = {}
+
+    def font(size: int) -> _PangoFont:
+        normalized = int(size)
+        if normalized not in font_cache:
+            font_cache[normalized] = text_backend.font(normalized)
+        return font_cache[normalized]
 
     def apply_rounded_corners(img: Image.Image, radius: int) -> Image.Image:
         mask = Image.new("L", img.size, 0)
@@ -66,71 +318,68 @@ def _run(spec: dict[str, Any]) -> list[str]:
         emoji_cache[cache_key] = rendered
         return rendered
 
-    emoji_by_first: dict[str, list[str]] = {}
-    for value in known_emojis:
-        if value:
-            emoji_by_first.setdefault(value[0], []).append(value)
-    for values in emoji_by_first.values():
-        values.sort(key=len, reverse=True)
+    class PangoDraw:
+        def __init__(self, image) -> None:
+            self.image = image
+            self.pillow_draw = ImageDraw.Draw(image)
 
-    def tokens(text: str) -> list[str]:
-        """增强词块识别：避免英文单词被截断"""
-        result: list[str] = []
-        index = 0
-        while index < len(text):
-            matched = None
-            for candidate in emoji_by_first.get(text[index], ()):
-                if text.startswith(candidate, index):
-                    matched = candidate
-                    break
-            if matched is not None:
-                result.append(matched)
-                index += len(matched)
-            elif text[index].isascii() and (text[index].isalnum() or text[index] in "'-_"):
-                start = index
-                while index < len(text) and text[index].isascii() and (text[index].isalnum() or text[index] in "'-_"):
-                    index += 1
-                result.append(text[start:index])
-            else:
-                result.append(text[index])
-                index += 1
-        return result
+        def __getattr__(self, name: str):
+            return getattr(self.pillow_draw, name)
 
-    def token_width(value: str, text_font) -> int:
-        if value in known_emojis:
-            return text_font.size
-        drawable = value.replace("\ufe0f", "").replace("\u200d", "")
-        try:
-            return max(1, round(text_font.getlength(drawable)))
-        except (OSError, ValueError):
-            return text_font.size
+        def text(self, xy, value, *, font=None, fill=(0, 0, 0), **kwargs):
+            if not isinstance(font, _PangoFont):
+                return self.pillow_draw.text(
+                    xy, value, font=font, fill=fill, **kwargs
+                )
+            layer, offset, placements = text_backend.render(
+                str(value), font.size, tuple(fill)
+            )
+            origin_x = round(float(xy[0]))
+            origin_y = round(float(xy[1]))
+            self.image.paste(
+                layer,
+                (origin_x + offset[0], origin_y + offset[1]),
+                layer,
+            )
+            for token, slot_x, slot_y in placements:
+                icon = emoji_image(token, font.size)
+                destination = (origin_x + slot_x, origin_y + slot_y)
+                if icon is not None:
+                    self.image.paste(icon, destination, icon)
+                    continue
+                x, y = destination
+                size = font.size
+                self.pillow_draw.rounded_rectangle(
+                    (x + 2, y + 2, x + size - 2, y + size - 2),
+                    radius=max(2, size // 6),
+                    fill=(239, 243, 246),
+                    outline=(160, 174, 184),
+                )
+            return None
 
-    def wrap(text: str, text_font, max_width: int) -> list[list[str]]:
-        if not text:
-            return []
-        lines: list[list[str]] = []
-        for paragraph in text.replace("\t", " ").split("\n"):
-            if not paragraph:
-                lines.append([])
-                continue
-            current: list[str] = []
-            current_width = 0
-            for value in tokens(paragraph):
-                width = token_width(value, text_font)
-                if current and current_width + width > max_width:
-                    lines.append(current)
-                    current = []
-                    current_width = 0
-                current.append(value)
-                current_width += width
-            if current:
-                lines.append(current)
-        return lines
+        def textbbox(self, xy, value, *, font=None, **kwargs):
+            if not isinstance(font, _PangoFont):
+                return self.pillow_draw.textbbox(xy, value, font=font, **kwargs)
+            left, top, right, bottom = text_backend.bbox(str(value), font.size)
+            origin_x = round(float(xy[0]))
+            origin_y = round(float(xy[1]))
+            return (
+                origin_x + left,
+                origin_y + top,
+                origin_x + right,
+                origin_y + bottom,
+            )
+
+    def text_draw(image) -> PangoDraw:
+        return PangoDraw(image)
+
+    def wrap(text: str, text_font: _PangoFont, max_width: int) -> list[str]:
+        return text_backend.wrap(text, text_font.size, max_width)
 
     def draw_lines(
         image,
         draw,
-        lines: list[list[str]],
+        lines: list[str],
         xy: tuple[int, int],
         text_font,
         fill: tuple[int, int, int],
@@ -138,34 +387,12 @@ def _run(spec: dict[str, Any]) -> list[str]:
     ) -> int:
         start_x, y = xy
         for line in lines:
-            x = start_x
-            for value in line:
-                icon = emoji_image(value, text_font.size)
-                if icon is not None:
-                    image.paste(
-                        icon, (x, y + max(0, (line_height - icon.height) // 2)), icon
-                    )
-                    x += text_font.size
-                    continue
-                if value in known_emojis:
-                    size = text_font.size
-                    top = y + max(1, (line_height - size) // 2)
-                    draw.rounded_rectangle(
-                        (x + 2, top + 2, x + size - 2, top + size - 2),
-                        radius=max(2, size // 6),
-                        fill=(239, 243, 246),
-                        outline=(160, 174, 184),
-                    )
-                    x += size
-                    continue
-                drawable = value.replace("\ufe0f", "").replace("\u200d", "")
-                try:
-                    draw.text((x, y), drawable, font=text_font, fill=fill)
-                except (OSError, UnicodeEncodeError):
-                    draw.text((x, y), "?", font=text_font, fill=fill)
-                x += token_width(value, text_font)
+            draw.text((start_x, y), line, font=text_font, fill=fill)
             y += line_height
         return y
+
+    def draw_text(draw, xy, value: str, text_font, fill) -> None:
+        draw.text(xy, value, font=text_font, fill=fill)
 
     def rounded_avatar(path_value: str, size: int, fallback_text: str):
         avatar = None
@@ -181,17 +408,17 @@ def _run(spec: dict[str, Any]) -> list[str]:
                 avatar = None
         if avatar is None:
             avatar = Image.new("RGBA", (size, size), (225, 232, 238, 255))
-            avatar_draw = ImageDraw.Draw(avatar)
-            fallback_font = font(max(18, size // 2))
+            avatar_draw = text_draw(avatar)
+            avatar_font = font(max(18, size // 2))
             letter = (fallback_text.strip() or "?")[:1]
-            box = avatar_draw.textbbox((0, 0), letter, font=fallback_font)
+            box = avatar_draw.textbbox((0, 0), letter, font=avatar_font)
             avatar_draw.text(
                 (
                     (size - (box[2] - box[0])) // 2,
                     (size - (box[3] - box[1])) // 2 - box[1],
                 ),
                 letter,
-                font=fallback_font,
+                font=avatar_font,
                 fill=(83, 100, 113),
             )
         mask = Image.new("L", (size, size), 0)
@@ -333,7 +560,7 @@ def _run(spec: dict[str, Any]) -> list[str]:
         height += padding
 
         card = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(card)
+        draw = text_draw(card)
 
         draw.rounded_rectangle(
             (0, 0, width - 1, height - 1),
@@ -352,11 +579,12 @@ def _run(spec: dict[str, Any]) -> list[str]:
         card.paste(avatar, (padding, y), avatar)
         text_x = padding + avatar_size + 14
 
-        draw.text(
+        draw_text(
+            draw,
             (text_x, y + 2),
             str(item.get("name", "")),
-            font=name_font,
-            fill=(15, 20, 25),
+            name_font,
+            (15, 20, 25),
         )
 
         handle = str(item.get("screen_name", ""))
@@ -365,8 +593,12 @@ def _run(spec: dict[str, Any]) -> list[str]:
         if created:
             meta = f"{meta} · {created}" if meta else created
 
-        draw.text(
-            (text_x, y + name_font.size + 8), meta, font=muted_font, fill=(83, 100, 113)
+        draw_text(
+            draw,
+            (text_x, y + name_font.size + 8),
+            meta,
+            muted_font,
+            (83, 100, 113),
         )
 
         y += header_height + 14
@@ -497,7 +729,7 @@ def _run(spec: dict[str, Any]) -> list[str]:
         page_font = font(16)
         total = len(pages)
         for index, page in enumerate(pages, 1):
-            page_draw = ImageDraw.Draw(page)
+            page_draw = text_draw(page)
             page_draw.text(
                 (page.width - 80, page.height - 27),
                 f"{index}/{total}",
@@ -532,7 +764,7 @@ def _run(spec: dict[str, Any]) -> list[str]:
         total_height += gap * (len(blocks) - 1) + 32
 
         canvas = Image.new("RGB", (width, total_height), (245, 247, 248))
-        canvas_draw = ImageDraw.Draw(canvas)
+        canvas_draw = text_draw(canvas)
         y = 20
 
         if ancestors:
@@ -584,7 +816,7 @@ def _run(spec: dict[str, Any]) -> list[str]:
         if not visible:
             height += 50
         image = Image.new("RGB", (width, height), (245, 247, 248))
-        draw = ImageDraw.Draw(image)
+        draw = text_draw(image)
         draw.rounded_rectangle(
             (24, 24, width - 24, height - 24),
             radius=18,
@@ -597,7 +829,9 @@ def _run(spec: dict[str, Any]) -> list[str]:
             draw.text((52, y), title, font=font(22), fill=color)
             y += 38
             for value in values:
-                draw.text((72, y), f"@{value}", font=font(20), fill=(15, 20, 25))
+                draw_text(
+                    draw, (72, y), f"@{value}", font(20), (15, 20, 25)
+                )
                 y += 36
             y += 16
         if not visible:
@@ -614,7 +848,7 @@ def _run(spec: dict[str, Any]) -> list[str]:
         )
         height = 210 + len(title_lines) * 44 + len(member_lines) * 32
         image = Image.new("RGB", (width, height), (245, 247, 248))
-        draw = ImageDraw.Draw(image)
+        draw = text_draw(image)
         draw.rounded_rectangle(
             (24, 24, width - 24, height - 24),
             radius=18,
@@ -633,11 +867,12 @@ def _run(spec: dict[str, Any]) -> list[str]:
         draw.rounded_rectangle(
             (52, y, width - 52, y + 50), radius=12, fill=(15, 20, 25)
         )
-        draw.text(
+        draw_text(
+            draw,
             (70, y + 10),
             str(spec.get("start_time_display", "")),
-            font=font(22),
-            fill=(255, 255, 255),
+            font(22),
+            (255, 255, 255),
         )
         return [image]
 
@@ -656,7 +891,7 @@ def _run(spec: dict[str, Any]) -> list[str]:
             + footer_height
         )
         image = Image.new("RGB", (width, height), (245, 245, 243))
-        draw = ImageDraw.Draw(image)
+        draw = text_draw(image)
         cal = spec.get("calendar", {})
         left, right = 26, width - 26
         draw.rectangle(
@@ -774,11 +1009,12 @@ def _run(spec: dict[str, Any]) -> list[str]:
                             text_x = x1 + 84
                         except (OSError, ValueError):
                             pass
-                    draw.text(
+                    draw_text(
+                        draw,
                         (text_x, event_y + 5),
                         str(event.get("time_disp", "")),
-                        font=font(13),
-                        fill=(76, 76, 76),
+                        font(13),
+                        (76, 76, 76),
                     )
                     title_lines = wrap(
                         str(event.get("title", "")), font(13), x2 - text_x - 15
