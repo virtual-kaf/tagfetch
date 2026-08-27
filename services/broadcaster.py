@@ -79,8 +79,9 @@ def conversation_without_avatars(candidate: PreparedCandidate):
 
 async def _render_cards(
     candidates: list[PreparedCandidate],
-) -> dict[str, list[Path]]:
+) -> tuple[dict[str, list[Path]], list[PreparedCandidate]]:
     cards: dict[str, list[Path]] = {}
+    fallback: list[PreparedCandidate] = []
     logger.info(
         "[TagfetchBroadcast] render batch starting candidates={}", len(candidates)
     )
@@ -92,11 +93,12 @@ async def _render_cards(
             paths = await render_conversation_card(
                 conversation_without_avatars(candidate)
             )
-        except Exception:  # noqa: BLE001 - one render failure skips that candidate
+        except Exception:  # noqa: BLE001 - isolate this candidate into fallback
             logger.exception(
-                "[TagfetchBroadcast] card render crashed tweet={}",
+                "[TagfetchBroadcast] renderer failure; fallback queued tweet={}",
                 candidate.tweet_id,
             )
+            fallback.append(candidate)
             continue
         if paths:
             cards[candidate.tweet_id] = [Path(path) for path in paths]
@@ -106,15 +108,116 @@ async def _render_cards(
             )
         else:
             logger.warning(
-                "[TagfetchBroadcast] card render returned no path tweet={}",
+                "[TagfetchBroadcast] renderer empty result; fallback queued tweet={}",
                 candidate.tweet_id,
             )
+            fallback.append(candidate)
     logger.info(
-        "[TagfetchBroadcast] render batch finished requested={} rendered={}",
+        "[TagfetchBroadcast] render batch finished requested={} rendered={} fallback={}",
         len(candidates),
         len(cards),
+        len(fallback),
     )
-    return cards
+    return cards, fallback
+
+
+def _displayed_items(candidate: PreparedCandidate):
+    """Yield the prepared thread/target/quote items once, in display order."""
+    seen: set[str] = set()
+    conversation = candidate.conversation
+    for item in [*conversation.ancestors, conversation.target, conversation.quote]:
+        if item is not None and item.id not in seen:
+            seen.add(item.id)
+            yield item
+
+
+async def _fallback_nodes(
+    candidate: PreparedCandidate, bot_id: str
+) -> list[dict]:
+    """Build a forward payload from prepared text and spooled originals only."""
+    nodes: list[dict] = []
+    for item in _displayed_items(candidate):
+        handle = item.author.screen_name or "tagfetch"
+        parts = [item.text.strip()]
+        if item.translated_text.strip():
+            parts.extend(("\n\n译文：", item.translated_text.strip()))
+        if item.url:
+            parts.extend(("\n\n", item.url))
+        content = "".join(parts).strip()
+        if content:
+            nodes.append({
+                "type": "node",
+                "data": {"name": f"@{handle}", "uin": bot_id, "content": content},
+            })
+
+    with tempfile.TemporaryDirectory(prefix="tagfetch_fallback_") as directory:
+        temporary_directory = Path(directory)
+        for position, image in enumerate(candidate.originals, start=1):
+            path = await asyncio.to_thread(
+                _original_path, image, temporary_directory, position
+            )
+            content = (
+                await asyncio.to_thread(image_cq_from_path, path)
+                if path is not None
+                else None
+            )
+            if content is None:
+                logger.warning(
+                    "[TagfetchBroadcast] fallback media skipped tweet={} index={}",
+                    candidate.tweet_id,
+                    position,
+                )
+                continue
+            nodes.append({
+                "type": "node",
+                "data": {
+                    "name": f"@{image.author_handle or 'tagfetch'} 原图 {image.media_index + 1}",
+                    "uin": bot_id,
+                    "content": content,
+                },
+            })
+    return nodes
+
+
+async def _send_renderer_fallback(
+    bot: Bot, group_id: str, candidate: PreparedCandidate
+) -> bool:
+    nodes = await _fallback_nodes(candidate, str(bot.self_id))
+    if not nodes:
+        logger.warning(
+            "[TagfetchBroadcast] renderer fallback has no sendable nodes group={} tweet={}",
+            group_id,
+            candidate.tweet_id,
+        )
+        return False
+    try:
+        await bot.call_api(
+            "send_group_forward_msg", group_id=int(group_id), messages=nodes
+        )
+    except Exception:  # noqa: BLE001 - candidate remains pending on failure
+        logger.exception(
+            "[TagfetchBroadcast] renderer fallback forward failed group={} tweet={}",
+            group_id,
+            candidate.tweet_id,
+        )
+        return False
+    logger.info(
+        "[TagfetchBroadcast] renderer fallback forward sent group={} tweet={} nodes={}",
+        group_id,
+        candidate.tweet_id,
+        len(nodes),
+    )
+    return True
+
+
+async def _send_renderer_fallbacks(
+    bot: Bot, group_id: str, candidates: list[PreparedCandidate]
+) -> list[PreparedCandidate]:
+    delivered: list[PreparedCandidate] = []
+    for candidate in candidates:
+        if await _send_renderer_fallback(bot, group_id, candidate):
+            delivered.append(candidate)
+    return delivered
 
 
 async def _card_node(
@@ -481,7 +584,7 @@ async def _broadcast_to_groups(
         len(group_ids),
     )
     try:
-        cards = await _render_cards(candidates)
+        cards, renderer_fallback = await _render_cards(candidates)
     finally:
         # Ensure no renderer child remains before constructing OneBot payloads.
         await shutdown_renderer()
@@ -506,7 +609,16 @@ async def _broadcast_to_groups(
                 await _wait_between_group_pushes()
             has_previous_group = True
             card_sent = await _send_cards(bot, group_id, pending, cards)
-            if not card_sent:
+            pending_ids = {candidate.tweet_id for candidate in pending}
+            fallback_pending = [
+                candidate
+                for candidate in renderer_fallback
+                if candidate.tweet_id in pending_ids
+            ]
+            fallback_sent = await _send_renderer_fallbacks(
+                bot, group_id, fallback_pending
+            )
+            if not card_sent and not fallback_sent:
                 continue
             for candidate in card_sent:
                 record_card_delivery(
@@ -514,10 +626,17 @@ async def _broadcast_to_groups(
                     group_id,
                     originals_sent=not candidate.originals,
                 )
+            for candidate in fallback_sent:
+                record_card_delivery(
+                    candidate.tweet_id,
+                    group_id,
+                    originals_sent=True,
+                )
             logger.info(
-                "[TagfetchBroadcast] card deliveries recorded group={} count={}",
+                "[TagfetchBroadcast] deliveries recorded group={} cards={} fallbacks={}",
                 group_id,
                 len(card_sent),
+                len(fallback_sent),
             )
             with_originals = [
                 candidate for candidate in card_sent if candidate.originals
