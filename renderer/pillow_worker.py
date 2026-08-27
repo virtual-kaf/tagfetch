@@ -226,6 +226,13 @@ class _PangoTextBackend:
         _diagnostic("pango-scale", value=self._pango_scale)
         self._measure_surface = _new_cairo_surface(cairo, "pango.measure", 1, 1)
         self._measure_context = cairo.Context(self._measure_surface)
+        self._grapheme_cache: dict[str, tuple[str, ...]] = {}
+        self._run_metrics_cache: dict[
+            tuple[str, int], tuple[float, tuple[float, float, float, float]]
+        ] = {}
+        self._cluster_advance_cache: dict[
+            tuple[tuple[str, ...], int], tuple[float, ...]
+        ] = {}
 
         try:
             font_map = PangoCairo.FontMap.get_default()
@@ -381,6 +388,9 @@ class _PangoTextBackend:
         """Return Pango cursor clusters without splitting shaped sequences."""
         if not text:
             return []
+        cached = self._grapheme_cache.get(text)
+        if cached is not None:
+            return list(cached)
         layout, _prepared, _slots = self._layout(
             text, 16, component="text.graphemes"
         )
@@ -401,17 +411,19 @@ class _PangoTextBackend:
                 if value.isspace():
                     boundaries.update((index, index + 1))
             ordered = sorted(boundaries)
-            return [
+            result = [
                 text[start:end]
                 for start, end in pairwise(ordered)
                 if end > start
             ]
-        return _fallback_graphemes(text)
+        else:
+            result = _fallback_graphemes(text)
+        self._grapheme_cache[text] = tuple(result)
+        return result
 
-    def run_metrics(
-        self, text: str, size: int, component: str = "text.fallback-metrics"
+    def _metrics_from_layout(
+        self, layout
     ) -> tuple[float, tuple[float, float, float, float]]:
-        layout, _prepared, _slots = self._layout(text, size, component=component)
         ink, logical = layout.get_extents()
         baseline = int(layout.get_baseline())
         scale = self._pango_scale
@@ -426,6 +438,61 @@ class _PangoTextBackend:
         )
         advance = _pango_to_pixels(layout.get_size()[0], scale)
         return advance, (left, top, right, bottom)
+
+    def cluster_advances(
+        self,
+        clusters: list[str],
+        size: int,
+        component: str = "text.fallback-clusters",
+    ) -> list[float]:
+        """Shape one fallback run once and apportion its logical advance."""
+        if not clusters:
+            return []
+        cache_key = (tuple(clusters), int(size))
+        cached = self._cluster_advance_cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
+        text = "".join(clusters)
+        layout, _prepared, _slots = self._layout(text, size, component=component)
+        metrics = self._metrics_from_layout(layout)
+        self._run_metrics_cache[(text, int(size))] = metrics
+        total_advance = metrics[0]
+
+        byte_offsets = [0]
+        encoded_length = 0
+        for cluster in clusters:
+            encoded_length += len(cluster.encode("utf-8"))
+            byte_offsets.append(encoded_length)
+        try:
+            positions = [
+                float(layout.get_cursor_pos(offset)[0].x)
+                for offset in byte_offsets
+            ]
+            raw_advances = [
+                abs(end - start)
+                for start, end in pairwise(positions)
+            ]
+        except (AttributeError, IndexError, TypeError, ValueError):
+            raw_advances = []
+        raw_total = sum(raw_advances)
+        if raw_total <= 0:
+            result = [total_advance / len(clusters)] * len(clusters)
+        else:
+            result = [total_advance * value / raw_total for value in raw_advances]
+        self._cluster_advance_cache[cache_key] = tuple(result)
+        return result
+
+    def run_metrics(
+        self, text: str, size: int, component: str = "text.fallback-metrics"
+    ) -> tuple[float, tuple[float, float, float, float]]:
+        cache_key = (text, int(size))
+        cached = self._run_metrics_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        layout, _prepared, _slots = self._layout(text, size, component=component)
+        metrics = self._metrics_from_layout(layout)
+        self._run_metrics_cache[cache_key] = metrics
+        return metrics
 
     def render_run(
         self,
@@ -560,6 +627,10 @@ class _HybridTextBackend:
             values.sort(key=len, reverse=True)
         self._font_cache: dict[int, Any] = {}
         self._coverage_cache: dict[str, bool] = {}
+        self._mixed_token_cache: dict[str, tuple[str, ...]] = {}
+        self._estimated_advance_cache: dict[
+            tuple[tuple[str, ...], int], tuple[float, ...]
+        ] = {}
         self._line_cache: dict[tuple[str, int], _HybridLine] = {}
         self._pango_backend: _PangoTextBackend | None = None
 
@@ -689,6 +760,9 @@ class _HybridTextBackend:
         return lines
 
     def _mixed_tokens(self, paragraph: str) -> list[str]:
+        cached = self._mixed_token_cache.get(paragraph)
+        if cached is not None:
+            return list(cached)
         chunks: list[tuple[str, str]] = []
         plain: list[str] = []
 
@@ -731,6 +805,7 @@ class _HybridTextBackend:
                     flush_ascii()
                     result.append(cluster)
         flush_ascii()
+        self._mixed_token_cache[paragraph] = tuple(result)
         return result
 
     def _run_kind(self, cluster: str) -> str:
@@ -740,23 +815,18 @@ class _HybridTextBackend:
             return "pillow"
         return "pango"
 
-    def layout_line(
-        self, text: str, size: int, component: str = "text.line-layout"
+    def _layout_tokens(
+        self,
+        text: str,
+        clusters: list[str],
+        size: int,
+        component: str,
     ) -> _HybridLine:
         cache_key = (text, int(size))
         cached = self._line_cache.get(cache_key)
         if cached is not None:
             return cached
         primary = self.primary_font(size)
-        if self.primary_covers(text):
-            clusters = self.tokens(text)
-        else:
-            clusters = []
-            for token in self._mixed_tokens(text):
-                if token in self._known_emojis:
-                    clusters.append(token)
-                else:
-                    clusters.extend(self._pango().graphemes(token))
 
         grouped: list[tuple[str, str]] = []
         for cluster in clusters:
@@ -801,6 +871,127 @@ class _HybridTextBackend:
         self._line_cache[cache_key] = line
         return line
 
+    def layout_line(
+        self, text: str, size: int, component: str = "text.line-layout"
+    ) -> _HybridLine:
+        clusters = (
+            self.tokens(text)
+            if self.primary_covers(text)
+            else self._mixed_tokens(text)
+        )
+        return self._layout_tokens(text, clusters, size, component)
+
+    def _wrap_tokens(
+        self, paragraph: str, text_font: _HybridFont, max_width: int
+    ) -> list[str]:
+        tokens: list[str] = []
+        for token in self._mixed_tokens(paragraph):
+            if (
+                token not in self._known_emojis
+                and len(token) > 1
+                and token.isascii()
+                and text_font.primary.getlength(self.drawable(token)) > max_width
+            ):
+                tokens.extend(token)
+            else:
+                tokens.append(token)
+        return tokens
+
+    def _estimated_advances(
+        self,
+        tokens: list[str],
+        text_font: _HybridFont,
+        component: str,
+    ) -> list[float]:
+        cache_key = (tuple(tokens), text_font.size)
+        cached = self._estimated_advance_cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
+        advances = [0.0] * len(tokens)
+        primary = text_font.primary
+        index = 0
+        while index < len(tokens):
+            kind = self._run_kind(tokens[index])
+            if kind == "emoji":
+                advances[index] = float(text_font.size)
+                index += 1
+                continue
+            if kind == "pillow":
+                advances[index] = float(
+                    primary.getlength(self.drawable(tokens[index]))
+                )
+                index += 1
+                continue
+            end = index + 1
+            while end < len(tokens) and self._run_kind(tokens[end]) == "pango":
+                end += 1
+            fallback_tokens = tokens[index:end]
+            fallback_advances = self._pango().cluster_advances(
+                fallback_tokens,
+                text_font.size,
+                f"{component}.estimate",
+            )
+            advances[index:end] = fallback_advances
+            index = end
+        self._estimated_advance_cache[cache_key] = tuple(advances)
+        return advances
+
+    def _wrap_mixed_paragraph(
+        self,
+        paragraph: str,
+        text_font: _HybridFont,
+        max_width: int,
+        component: str,
+    ) -> list[_HybridLine]:
+        tokens = self._wrap_tokens(paragraph, text_font, max_width)
+        estimates = self._estimated_advances(tokens, text_font, component)
+        lines: list[_HybridLine] = []
+        start = 0
+        while start < len(tokens):
+            end = start
+            estimated_width = 0.0
+            while end < len(tokens):
+                candidate_width = estimated_width + estimates[end]
+                if end > start and candidate_width > max_width:
+                    break
+                estimated_width = candidate_width
+                end += 1
+
+            candidate_tokens = tokens[start:end]
+            candidate_text = "".join(candidate_tokens)
+            line = self._layout_tokens(
+                candidate_text,
+                candidate_tokens,
+                text_font.size,
+                component,
+            )
+            while end > start + 1 and line.advance > max_width:
+                end -= 1
+                candidate_tokens = tokens[start:end]
+                candidate_text = "".join(candidate_tokens)
+                line = self._layout_tokens(
+                    candidate_text,
+                    candidate_tokens,
+                    text_font.size,
+                    component,
+                )
+            while end < len(tokens):
+                candidate_tokens = tokens[start : end + 1]
+                candidate_text = "".join(candidate_tokens)
+                candidate_line = self._layout_tokens(
+                    candidate_text,
+                    candidate_tokens,
+                    text_font.size,
+                    component,
+                )
+                if candidate_line.advance > max_width:
+                    break
+                line = candidate_line
+                end += 1
+            lines.append(line)
+            start = end
+        return lines
+
     def wrap(
         self,
         text: str,
@@ -818,27 +1009,11 @@ class _HybridTextBackend:
             if not paragraph:
                 lines.append(self.layout_line("", text_font.size, component))
                 continue
-            current = ""
-            tokens: list[str] = []
-            for token in self._mixed_tokens(paragraph):
-                if (
-                    token not in self._known_emojis
-                    and self.layout_line(token, text_font.size, component).advance
-                    > max_width
-                ):
-                    tokens.extend(self._pango().graphemes(token))
-                else:
-                    tokens.append(token)
-            for token in tokens:
-                candidate = current + token
-                candidate_line = self.layout_line(candidate, text_font.size, component)
-                if current and candidate_line.advance > max_width:
-                    lines.append(self.layout_line(current, text_font.size, component))
-                    current = token
-                else:
-                    current = candidate
-            if current:
-                lines.append(self.layout_line(current, text_font.size, component))
+            lines.extend(
+                self._wrap_mixed_paragraph(
+                    paragraph, text_font, max_width, component
+                )
+            )
         return lines
 
     def measure(

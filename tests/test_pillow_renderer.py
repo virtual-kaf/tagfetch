@@ -2,7 +2,7 @@ import math
 from pathlib import Path
 
 import pytest
-from nonebot_plugin_tagfetch.models import PreparedCandidate
+from nonebot_plugin_tagfetch.models import DownloadedImage, PreparedCandidate
 from nonebot_plugin_tagfetch.models.tweet import (
     TweetAuthor,
     TweetConversation,
@@ -39,12 +39,25 @@ def _hybrid_backend(known_emojis: set[str] | None = None):
 
 
 class _FakePangoBackend:
+    def __init__(self) -> None:
+        self.grapheme_calls = 0
+        self.cluster_calls = 0
+        self.metric_calls = 0
+
     def graphemes(self, text: str) -> list[str]:
+        self.grapheme_calls += 1
         return pillow_worker._fallback_graphemes(text)
 
     def run_metrics(self, text: str, size: int, _component: str):
-        advance = len(self.graphemes(text)) * size * 0.7
+        self.metric_calls += 1
+        advance = len(pillow_worker._fallback_graphemes(text)) * size * 0.7
         return advance, (0.0, -size * 0.8, advance, size * 0.2)
+
+    def cluster_advances(
+        self, clusters: list[str], size: int, _component: str
+    ) -> list[float]:
+        self.cluster_calls += 1
+        return [size * 0.7] * len(clusters)
 
 
 def _tweet(tweet_id: str, text: str = "原文") -> TweetItem:
@@ -190,6 +203,95 @@ async def test_forward_send_flattens_pages_and_accounts_complete_candidates(
         "first-2.jpg",
         "second-1.jpg",
     ]
+
+
+@pytest.mark.asyncio
+async def test_renderer_failure_fallback_forwards_prepared_text(monkeypatch):
+    candidate = _candidate("fallback")
+    candidate.conversation.target.translated_text = "翻译"
+    candidate.conversation.quote = _tweet("quote", "引用")
+
+    class Bot:
+        self_id = "123"
+
+        async def call_api(self, api, **kwargs):
+            calls.append((api, kwargs))
+
+    calls = []
+    assert await broadcaster._send_renderer_fallback(Bot(), "100", candidate)
+    assert [api for api, _kwargs in calls] == ["send_group_forward_msg"]
+    nodes = calls[0][1]["messages"]
+    assert [node["data"]["name"] for node in nodes] == ["@author", "@author"]
+    assert "原文" in nodes[0]["data"]["content"]
+    assert "翻译" in nodes[0]["data"]["content"]
+    assert "引用" in nodes[1]["data"]["content"]
+
+
+@pytest.mark.asyncio
+async def test_renderer_failure_fallback_skips_one_unavailable_original(tmp_path):
+    candidate = _candidate("fallback")
+    candidate.originals = [
+        DownloadedImage(
+            source_url="https://pbs.twimg.com/media/missing.jpg",
+            data=b"",
+            mime_type="image/jpeg",
+            source_tweet_id="fallback",
+            author_handle="author",
+            media_index=0,
+            local_path=tmp_path / "missing.jpg",
+        )
+    ]
+
+    nodes = await broadcaster._fallback_nodes(candidate, "123")
+
+    assert len(nodes) == 1
+    assert "原文" in nodes[0]["data"]["content"]
+
+
+@pytest.mark.asyncio
+async def test_renderer_failure_fallback_forward_failure_is_unsent():
+    candidate = _candidate("fallback")
+
+    class Bot:
+        self_id = "123"
+
+        async def call_api(self, _api, **_kwargs):
+            raise RuntimeError("forward unavailable")
+
+    assert not await broadcaster._send_renderer_fallback(Bot(), "100", candidate)
+
+
+@pytest.mark.asyncio
+async def test_renderer_failure_fallback_records_delivery_only_on_success(monkeypatch):
+    candidate = _candidate("fallback")
+    records = []
+
+    async def render(_conversation):
+        raise RuntimeError("renderer unavailable")
+
+    async def shutdown():
+        return None
+
+    class Bot:
+        self_id = "123"
+
+        async def call_api(self, _api, **_kwargs):
+            return None
+
+    monkeypatch.setattr(broadcaster, "render_conversation_card", render)
+    monkeypatch.setattr(broadcaster, "shutdown_renderer", shutdown)
+    monkeypatch.setattr(broadcaster, "has_delivery", lambda *_args: False)
+    monkeypatch.setattr(
+        broadcaster,
+        "record_card_delivery",
+        lambda tweet_id, group_id, **kwargs: records.append(
+            (tweet_id, group_id, kwargs["originals_sent"])
+        ),
+    )
+
+    await broadcaster._broadcast_to_groups(Bot(), [candidate], ["100"])
+
+    assert records == [("fallback", "100", True)]
 
 
 def test_tagfetch_renderer_is_browser_free_and_independent():
@@ -340,6 +442,34 @@ def test_tagfetch_hybrid_mixed_wrap_splits_an_oversized_ascii_token():
     assert len(lines) > 2
     assert all(isinstance(line, pillow_worker._HybridLine) for line in lines)
     assert all(line.advance <= 120 for line in lines)
+
+
+def test_tagfetch_hybrid_mixed_wrap_keeps_pango_layout_calls_linear():
+    backend = _hybrid_backend()
+    fake_pango = _FakePangoBackend()
+    backend._pango_backend = fake_pango
+    text_font = backend.font(24)
+    sample = "中文 " + "देवनागरी" * 24 + " English"
+
+    lines = backend.wrap(sample, text_font, 220)
+
+    assert len(lines) > 4
+    assert fake_pango.grapheme_calls == 1
+    assert fake_pango.cluster_calls == 1
+    assert fake_pango.metric_calls <= len(lines) * 2
+    assert all(line.advance <= 220 for line in lines)
+
+    calls = (
+        fake_pango.grapheme_calls,
+        fake_pango.cluster_calls,
+        fake_pango.metric_calls,
+    )
+    assert backend.wrap(sample, text_font, 220) == lines
+    assert (
+        fake_pango.grapheme_calls,
+        fake_pango.cluster_calls,
+        fake_pango.metric_calls,
+    ) == calls
 
 
 def test_tagfetch_fallback_graphemes_keep_marks_zwj_and_flags_together():
