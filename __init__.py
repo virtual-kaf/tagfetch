@@ -22,7 +22,7 @@ else:
     __plugin_meta__ = PluginMetadata(
         name="tagfetch",
         description="安全发现并推送热门 hashtag 推文",
-        usage="/kabubu artworks on | off",
+        usage="/artworks on | off | /美术部 on | off",
         type="application",
         supported_adapters={"~onebot.v11"},
     )
