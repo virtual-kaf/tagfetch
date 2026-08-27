@@ -1,3 +1,4 @@
+import math
 from pathlib import Path
 
 import pytest
@@ -29,6 +30,21 @@ requires_pango = pytest.mark.skipif(
     not _pango_runtime_available(),
     reason="PangoCairo/fontconfig integration tests require the target Linux runtime",
 )
+
+
+def _hybrid_backend(known_emojis: set[str] | None = None):
+    return pillow_worker._HybridTextBackend(
+        engine.FONT_PATH, known_emojis or set(), Image, ImageFont
+    )
+
+
+class _FakePangoBackend:
+    def graphemes(self, text: str) -> list[str]:
+        return pillow_worker._fallback_graphemes(text)
+
+    def run_metrics(self, text: str, size: int, _component: str):
+        advance = len(self.graphemes(text)) * size * 0.7
+        return advance, (0.0, -size * 0.8, advance, size * 0.2)
 
 
 def _tweet(tweet_id: str, text: str = "原文") -> TweetItem:
@@ -256,6 +272,141 @@ def test_tagfetch_stats_row_uses_twitter_style_outline_icons():
     source = Path(pillow_worker.__file__).read_text(encoding="utf-8")
     for old_icon in ('("💬"', '("🔁"', '("❤️"', '("👁"'):
         assert old_icon not in source
+
+
+def test_tagfetch_hybrid_fast_path_matches_original_pillow_metrics_and_wrap():
+    backend = _hybrid_backend()
+    text_font = backend.font(21)
+    sample = "普通中文 English 日本語 mixed text"
+    max_width = 150
+
+    expected_lines = []
+    for paragraph in sample.replace("\t", " ").split("\n"):
+        current = []
+        current_width = 0
+        for value in backend.tokens(paragraph):
+            width = backend.token_width(value, text_font)
+            if current and current_width + width > max_width:
+                expected_lines.append(current)
+                current = []
+                current_width = 0
+            current.append(value)
+            current_width += width
+        if current:
+            expected_lines.append(current)
+
+    assert backend.primary_covers(sample)
+    assert backend.measure(sample, 21) == text_font.primary.getlength(sample)
+    assert backend.bbox(sample, 21) == text_font.primary.getbbox(sample)
+    assert backend.wrap(sample, text_font, max_width) == expected_lines
+    assert not backend.pango_initialized
+
+
+def test_tagfetch_hybrid_twemoji_run_does_not_initialize_pango():
+    backend = _hybrid_backend({"❤️"})
+
+    line = backend.layout_line("中文 ❤️ English", 21)
+
+    assert [run.renderer for run in line.runs] == ["pillow", "emoji", "pillow"]
+    assert not backend.pango_initialized
+
+
+def test_tagfetch_hybrid_mixed_layout_can_run_without_local_pango():
+    backend = _hybrid_backend()
+    backend._pango_backend = _FakePangoBackend()
+    text_font = backend.font(24)
+
+    line = backend.layout_line("中文 कि देवनागरी English", 24)
+    wrapped = backend.wrap(
+        "中文 कि देवनागरी English العربية end", text_font, 220
+    )
+
+    run_kinds = [run.renderer for run in line.runs]
+    assert run_kinds[0] == "pillow"
+    assert "pango" in run_kinds
+    assert run_kinds[-1] == "pillow"
+    assert any("कि" in run.text for run in line.runs if run.renderer == "pango")
+    assert all(isinstance(value, pillow_worker._HybridLine) for value in wrapped)
+    assert all(value.advance <= 220 for value in wrapped)
+
+
+def test_tagfetch_hybrid_mixed_wrap_splits_an_oversized_ascii_token():
+    backend = _hybrid_backend()
+    backend._pango_backend = _FakePangoBackend()
+    text_font = backend.font(24)
+
+    lines = backend.wrap("中文 देवनागरी " + "longword" * 12, text_font, 120)
+
+    assert len(lines) > 2
+    assert all(isinstance(line, pillow_worker._HybridLine) for line in lines)
+    assert all(line.advance <= 120 for line in lines)
+
+
+def test_tagfetch_fallback_graphemes_keep_marks_zwj_and_flags_together():
+    clusters = pillow_worker._fallback_graphemes("कि क्\u200dष 👨🏽\u200d💻 🇨🇳")
+
+    assert "कि" in clusters
+    assert "क्\u200dष" in clusters
+    assert "👨🏽\u200d💻" in clusters
+    assert "🇨🇳" in clusters
+
+
+@requires_pango
+def test_tagfetch_hybrid_line_interleaves_pillow_and_pango_runs():
+    backend = _hybrid_backend()
+    sample = "中文 कि देवनागरी ગુજરાતી བོད་ཡིག ქართული العربية English"
+
+    line = backend.layout_line(sample, 24)
+    run_kinds = [run.renderer for run in line.runs]
+
+    assert run_kinds[0] == "pillow"
+    assert "pango" in run_kinds
+    assert run_kinds[-1] == "pillow"
+    assert any("कि" in run.text for run in line.runs if run.renderer == "pango")
+    assert backend._pango().unknown_glyphs(sample) == 0
+
+
+@requires_pango
+def test_tagfetch_hybrid_wrap_and_render_share_advance_baseline_and_bbox():
+    backend = _hybrid_backend()
+    text_font = backend.font(24)
+    lines = backend.wrap(
+        "中文 देवनागरी English العربية ગુજરાતી end" * 3,
+        text_font,
+        260,
+        "test.hybrid-wrap",
+    )
+
+    assert lines
+    assert all(isinstance(line, pillow_worker._HybridLine) for line in lines)
+    assert all(line.advance <= 260 for line in lines)
+
+    line = lines[0]
+    image = Image.new("RGBA", (340, 90), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    backend.render_line(
+        image,
+        draw,
+        line,
+        (20, 18),
+        text_font,
+        (15, 20, 25),
+        lambda _token, _size: None,
+        line_height=36,
+        component="test.hybrid-render",
+    )
+    actual = image.getchannel("A").getbbox()
+    ascent, _descent = text_font.primary.getmetrics()
+    expected = (
+        20 + math.floor(line.bbox[0]),
+        18 + ascent + math.floor(line.bbox[1]),
+        20 + math.ceil(line.bbox[2]),
+        18 + ascent + math.ceil(line.bbox[3]),
+    )
+
+    assert actual is not None
+    assert expected[0] <= actual[0] <= actual[2] <= expected[2]
+    assert expected[1] <= actual[1] <= actual[3] <= expected[3]
 
 
 @requires_pango

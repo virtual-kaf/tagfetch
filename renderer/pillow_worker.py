@@ -8,8 +8,12 @@ before starting the worker.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
+import unicodedata
+from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -185,29 +189,11 @@ def _apply_memory_limit(megabytes: int) -> None:
         pass
 
 
-class _PangoFont:
-    def __init__(self, backend: _PangoTextBackend, size: int) -> None:
-        self.backend = backend
-        self.size = int(size)
-
-    def getlength(self, value: str) -> float:
-        return float(self.backend.measure(value, self.size, "font.getlength"))
-
-
 class _PangoTextBackend:
-    """Shape and rasterize text with PangoCairo and fontconfig."""
-
-    _OBJECT_REPLACEMENT = "\ufffc"
+    """Shape and rasterize fallback runs with PangoCairo and fontconfig."""
 
     def __init__(self, font_path: Path, known_emojis: set[str], image, image_font) -> None:
         self._Image = image
-        self._known_emojis = known_emojis
-        self._emoji_by_first: dict[str, list[str]] = {}
-        for value in known_emojis:
-            if value:
-                self._emoji_by_first.setdefault(value[0], []).append(value)
-        for values in self._emoji_by_first.values():
-            values.sort(key=len, reverse=True)
 
         try:
             import cairo
@@ -262,6 +248,9 @@ class _PangoTextBackend:
             raise RuntimeError("fontconfig shared library not found")
         try:
             fontconfig = ctypes.CDLL(library_name)
+        except OSError as exc:
+            raise RuntimeError("fontconfig shared library not found") from exc
+        try:
             fontconfig.FcInit.argtypes = []
             fontconfig.FcInit.restype = ctypes.c_int
             fontconfig.FcConfigGetCurrent.argtypes = []
@@ -286,34 +275,6 @@ class _PangoTextBackend:
         if not fontconfig.FcConfigBuildFonts(config):
             raise RuntimeError("fontconfig failed to rebuild its application font set")
 
-    def font(self, size: int) -> _PangoFont:
-        return _PangoFont(self, size)
-
-    def _prepare_text(
-        self, text: str
-    ) -> tuple[str, list[tuple[int, str]]]:
-        result: list[str] = []
-        slots: list[tuple[int, str]] = []
-        byte_offset = 0
-        index = 0
-        while index < len(text):
-            matched = None
-            for candidate in self._emoji_by_first.get(text[index], ()):
-                if text.startswith(candidate, index):
-                    matched = candidate
-                    break
-            if matched is None:
-                value = text[index]
-                result.append(value)
-                byte_offset += len(value.encode("utf-8"))
-                index += 1
-                continue
-            result.append(self._OBJECT_REPLACEMENT)
-            slots.append((byte_offset, matched))
-            byte_offset += len(self._OBJECT_REPLACEMENT.encode("utf-8"))
-            index += len(matched)
-        return "".join(result), slots
-
     def _layout(
         self,
         text: str,
@@ -322,7 +283,6 @@ class _PangoTextBackend:
         component: str = "text",
     ):
         Pango = self._Pango
-        prepared, slots = self._prepare_text(text)
         layout = self._PangoCairo.create_layout(self._measure_context)
         description = Pango.FontDescription()
         description.set_family(self.family)
@@ -338,33 +298,20 @@ class _PangoTextBackend:
             )
             layout.set_width(wrap_width_units)
             layout.set_wrap(Pango.WrapMode.WORD_CHAR)
-        layout.set_text(prepared, -1)
+        layout.set_text(text, -1)
 
         attributes = Pango.AttrList()
         fallback = Pango.attr_fallback_new(True)
         fallback.start_index = 0
         fallback.end_index = 0xFFFFFFFF
         attributes.insert(fallback)
-        replacement_bytes = len(self._OBJECT_REPLACEMENT.encode("utf-8"))
-        for byte_offset, _token in slots:
-            ink = Pango.Rectangle()
-            logical = Pango.Rectangle()
-            ink.x = logical.x = 0
-            emoji_size_units = _pixels_to_pango(int(size), self._pango_scale)
-            ink.y = logical.y = -emoji_size_units
-            ink.width = logical.width = emoji_size_units
-            ink.height = logical.height = emoji_size_units
-            shape = Pango.attr_shape_new(ink, logical)
-            shape.start_index = byte_offset
-            shape.end_index = byte_offset + replacement_bytes
-            attributes.insert(shape)
         layout.set_attributes(attributes)
         pixel_width, pixel_height = layout.get_pixel_size()
         units_width, units_height = layout.get_size()
         _diagnostic(
             "pango-layout",
             component=component,
-            text_bytes=len(prepared.encode("utf-8")),
+            text_bytes=len(text.encode("utf-8")),
             font_px=int(size),
             font_units=font_size_units,
             wrap_px="none" if max_width is None else int(max_width),
@@ -386,18 +333,7 @@ class _PangoTextBackend:
             max(1, int(pixel_height)),
             4,
         )
-        return layout, prepared, slots
-
-    @staticmethod
-    def _restore_emojis(
-        prepared: str, slots: list[tuple[int, str]], start: int, end: int
-    ) -> str:
-        raw = prepared.encode("utf-8")
-        restored = raw[start:end].decode("utf-8")
-        for byte_offset, token in slots:
-            if start <= byte_offset < end:
-                restored = restored.replace("\ufffc", token, 1)
-        return restored
+        return layout, text, []
 
     def wrap(
         self, text: str, size: int, max_width: int, component: str = "text.wrap"
@@ -405,14 +341,14 @@ class _PangoTextBackend:
         if not text:
             return []
         normalized = text.replace("\t", " ")
-        layout, prepared, slots = self._layout(
+        layout, prepared, _slots = self._layout(
             normalized, size, max_width, component
         )
         lines: list[str] = []
         for line in layout.get_lines_readonly():
             start = int(line.start_index)
             end = start + int(line.length)
-            lines.append(self._restore_emojis(prepared, slots, start, end))
+            lines.append(prepared.encode("utf-8")[start:end].decode("utf-8"))
         return lines
 
     def measure(self, text: str, size: int, component: str = "text.measure") -> int:
@@ -441,15 +377,66 @@ class _PangoTextBackend:
         )
         return int(layout.get_unknown_glyphs_count())
 
-    def render(
+    def graphemes(self, text: str) -> list[str]:
+        """Return Pango cursor clusters without splitting shaped sequences."""
+        if not text:
+            return []
+        layout, _prepared, _slots = self._layout(
+            text, 16, component="text.graphemes"
+        )
+        attrs = layout.get_log_attrs_readonly()
+        if len(attrs) == len(text) + 1:
+            safe_boundaries = {0}
+            position = 0
+            for cluster in _fallback_graphemes(text):
+                position += len(cluster)
+                safe_boundaries.add(position)
+            boundaries = {0, len(text)}
+            boundaries.update(
+                index
+                for index, attr in enumerate(attrs)
+                if bool(attr.is_cursor_position) and index in safe_boundaries
+            )
+            for index, value in enumerate(text):
+                if value.isspace():
+                    boundaries.update((index, index + 1))
+            ordered = sorted(boundaries)
+            return [
+                text[start:end]
+                for start, end in pairwise(ordered)
+                if end > start
+            ]
+        return _fallback_graphemes(text)
+
+    def run_metrics(
+        self, text: str, size: int, component: str = "text.fallback-metrics"
+    ) -> tuple[float, tuple[float, float, float, float]]:
+        layout, _prepared, _slots = self._layout(text, size, component=component)
+        ink, logical = layout.get_extents()
+        baseline = int(layout.get_baseline())
+        scale = self._pango_scale
+        left = _pango_to_pixels(min(ink.x, logical.x), scale)
+        top = _pango_to_pixels(min(ink.y, logical.y) - baseline, scale)
+        right = _pango_to_pixels(
+            max(ink.x + ink.width, logical.x + logical.width), scale
+        )
+        bottom = _pango_to_pixels(
+            max(ink.y + ink.height, logical.y + logical.height) - baseline,
+            scale,
+        )
+        advance = _pango_to_pixels(layout.get_size()[0], scale)
+        return advance, (left, top, right, bottom)
+
+    def render_run(
         self,
         text: str,
         size: int,
         fill: tuple[int, ...],
-        component: str = "text.render",
-    ) -> tuple[Any, tuple[int, int], list[tuple[str, int, int]]]:
-        layout, _prepared, slots = self._layout(text, size, component=component)
+        component: str = "text.fallback-render",
+    ) -> tuple[Any, tuple[int, int]]:
+        layout, _prepared, _slots = self._layout(text, size, component=component)
         ink, logical = layout.get_pixel_extents()
+        baseline = round(_pango_to_pixels(layout.get_baseline(), self._pango_scale))
         left = min(0, int(ink.x), int(logical.x))
         top = min(0, int(ink.y), int(logical.y))
         right = max(1, int(ink.x + ink.width), int(logical.x + logical.width))
@@ -476,21 +463,466 @@ class _PangoTextBackend:
             surface.get_stride(),
             1,
         ).convert("RGBA")
+        return layer, (left, top - baseline)
 
-        placements: list[tuple[str, int, int]] = []
-        for byte_offset, token in slots:
-            position = layout.index_to_pos(byte_offset)
-            slot_x = round(_pango_to_pixels(position.x, self._pango_scale))
-            slot_y = round(
-                _pango_to_pixels(position.y, self._pango_scale)
-                + max(
-                    0,
-                    _pango_to_pixels(position.height, self._pango_scale) - size,
-                )
-                / 2
+    def render(
+        self,
+        text: str,
+        size: int,
+        fill: tuple[int, ...],
+        component: str = "text.render",
+    ) -> tuple[Any, tuple[int, int], list[tuple[str, int, int]]]:
+        layer, offset = self.render_run(text, size, fill, component)
+        return layer, offset, []
+
+
+def _fallback_graphemes(text: str) -> list[str]:
+    """Defensive Unicode cluster fallback if a Pango binding omits log attrs."""
+    clusters: list[str] = []
+    regional_count = 0
+    for value in text:
+        codepoint = ord(value)
+        category = unicodedata.category(value)
+        extend = (
+            category.startswith("M")
+            or codepoint in range(0xFE00, 0xFE10)
+            or codepoint in range(0xE0100, 0xE01F0)
+            or codepoint in range(0x1F3FB, 0x1F400)
+            or value == "\u200d"
+            or (clusters and clusters[-1].endswith("\u200d"))
+        )
+        regional = 0x1F1E6 <= codepoint <= 0x1F1FF
+        if not clusters or (not extend and not (regional and regional_count % 2)):
+            clusters.append(value)
+        else:
+            clusters[-1] += value
+        regional_count = regional_count + 1 if regional else 0
+    return clusters
+
+
+@dataclass(frozen=True)
+class _TextRun:
+    renderer: str
+    text: str
+    advance: float
+    bbox: tuple[float, float, float, float]
+
+
+@dataclass(frozen=True)
+class _HybridLine:
+    text: str
+    runs: tuple[_TextRun, ...]
+    advance: float
+    bbox: tuple[float, float, float, float]
+
+
+class _HybridFont:
+    def __init__(self, backend: _HybridTextBackend, size: int, primary) -> None:
+        self.backend = backend
+        self.size = int(size)
+        self.primary = primary
+
+    def getlength(self, value: str) -> float:
+        return float(self.backend.measure(str(value), self.size, "font.getlength"))
+
+
+class _HybridTextBackend:
+    """Use the bundled Pillow font first and Pango only for missing glyphs."""
+
+    def __init__(self, font_path: Path, known_emojis: set[str], image, image_font) -> None:
+        if not font_path.is_file():
+            raise RuntimeError(f"bundled renderer font missing: {font_path}")
+        try:
+            from fontTools.ttLib import TTFont
+
+            font_file = TTFont(str(font_path), lazy=True)
+            try:
+                best_cmap = font_file.getBestCmap()
+                self._coverage = frozenset((best_cmap or {}).keys())
+            finally:
+                font_file.close()
+        except (ImportError, OSError, ValueError) as exc:
+            raise RuntimeError(
+                "unable to read bundled renderer font coverage with FontTools"
+            ) from exc
+        if not self._coverage:
+            raise RuntimeError(f"bundled renderer font has no Unicode cmap: {font_path}")
+
+        self._font_path = font_path
+        self._Image = image
+        self._ImageFont = image_font
+        self._known_emojis = known_emojis
+        self._emoji_by_first: dict[str, list[str]] = {}
+        for value in known_emojis:
+            if value:
+                self._emoji_by_first.setdefault(value[0], []).append(value)
+        for values in self._emoji_by_first.values():
+            values.sort(key=len, reverse=True)
+        self._font_cache: dict[int, Any] = {}
+        self._coverage_cache: dict[str, bool] = {}
+        self._line_cache: dict[tuple[str, int], _HybridLine] = {}
+        self._pango_backend: _PangoTextBackend | None = None
+
+    @property
+    def pango_initialized(self) -> bool:
+        return self._pango_backend is not None
+
+    def _pango(self) -> _PangoTextBackend:
+        if self._pango_backend is None:
+            self._pango_backend = _PangoTextBackend(
+                self._font_path, set(), self._Image, self._ImageFont
             )
-            placements.append((token, slot_x, slot_y))
-        return layer, (left, top), placements
+        return self._pango_backend
+
+    def primary_font(self, size: int):
+        normalized = int(size)
+        if normalized not in self._font_cache:
+            try:
+                self._font_cache[normalized] = self._ImageFont.truetype(
+                    str(self._font_path), normalized
+                )
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(
+                    f"unable to load bundled renderer font: {self._font_path}"
+                ) from exc
+        return self._font_cache[normalized]
+
+    def font(self, size: int) -> _HybridFont:
+        normalized = int(size)
+        return _HybridFont(self, normalized, self.primary_font(normalized))
+
+    def _emoji_at(self, text: str, index: int) -> str | None:
+        for candidate in self._emoji_by_first.get(text[index], ()):
+            if text.startswith(candidate, index):
+                return candidate
+        return None
+
+    @staticmethod
+    def _ignorable(value: str) -> bool:
+        codepoint = ord(value)
+        return (
+            value in {"\n", "\r", "\t", "\u200d"}
+            or unicodedata.category(value) in {"Cc", "Cf", "Zl", "Zp"}
+            or 0xFE00 <= codepoint <= 0xFE0F
+            or 0xE0100 <= codepoint <= 0xE01EF
+        )
+
+    def primary_covers(self, text: str) -> bool:
+        cached = self._coverage_cache.get(text)
+        if cached is not None:
+            return cached
+        index = 0
+        covered = True
+        while index < len(text):
+            emoji = self._emoji_at(text, index)
+            if emoji is not None:
+                index += len(emoji)
+                continue
+            value = text[index]
+            if not self._ignorable(value) and ord(value) not in self._coverage:
+                covered = False
+                break
+            index += 1
+        self._coverage_cache[text] = covered
+        return covered
+
+    def has_known_emoji(self, text: str) -> bool:
+        return any(
+            self._emoji_at(text, index) is not None for index in range(len(text))
+        )
+
+    def tokens(self, text: str) -> list[str]:
+        """Preserve the original tweet_card Pillow tokenization."""
+        result: list[str] = []
+        index = 0
+        while index < len(text):
+            matched = self._emoji_at(text, index)
+            if matched is not None:
+                result.append(matched)
+                index += len(matched)
+            elif text[index].isascii() and (
+                text[index].isalnum() or text[index] in "'-_"
+            ):
+                start = index
+                while index < len(text) and text[index].isascii() and (
+                    text[index].isalnum() or text[index] in "'-_"
+                ):
+                    index += 1
+                result.append(text[start:index])
+            else:
+                result.append(text[index])
+                index += 1
+        return result
+
+    @staticmethod
+    def drawable(value: str) -> str:
+        return value.replace("\ufe0f", "").replace("\u200d", "")
+
+    def token_width(self, value: str, text_font: _HybridFont) -> int:
+        if value in self._known_emojis:
+            return text_font.size
+        try:
+            return max(1, round(text_font.primary.getlength(self.drawable(value))))
+        except (OSError, ValueError):
+            return text_font.size
+
+    def _legacy_wrap(
+        self, text: str, text_font: _HybridFont, max_width: int
+    ) -> list[list[str]]:
+        lines: list[list[str]] = []
+        for paragraph in text.replace("\t", " ").split("\n"):
+            if not paragraph:
+                lines.append([])
+                continue
+            current: list[str] = []
+            current_width = 0
+            for value in self.tokens(paragraph):
+                width = self.token_width(value, text_font)
+                if current and current_width + width > max_width:
+                    lines.append(current)
+                    current = []
+                    current_width = 0
+                current.append(value)
+                current_width += width
+            if current:
+                lines.append(current)
+        return lines
+
+    def _mixed_tokens(self, paragraph: str) -> list[str]:
+        chunks: list[tuple[str, str]] = []
+        plain: list[str] = []
+
+        def flush_plain() -> None:
+            if plain:
+                chunks.append(("plain", "".join(plain)))
+                plain.clear()
+
+        index = 0
+        while index < len(paragraph):
+            emoji = self._emoji_at(paragraph, index)
+            if emoji is None:
+                plain.append(paragraph[index])
+                index += 1
+                continue
+            flush_plain()
+            chunks.append(("emoji", emoji))
+            index += len(emoji)
+        flush_plain()
+
+        result: list[str] = []
+        ascii_word: list[str] = []
+
+        def flush_ascii() -> None:
+            if ascii_word:
+                result.append("".join(ascii_word))
+                ascii_word.clear()
+
+        for kind, chunk in chunks:
+            if kind == "emoji":
+                flush_ascii()
+                result.append(chunk)
+                continue
+            for cluster in self._pango().graphemes(chunk):
+                if len(cluster) == 1 and cluster.isascii() and (
+                    cluster.isalnum() or cluster in "'-_"
+                ):
+                    ascii_word.append(cluster)
+                else:
+                    flush_ascii()
+                    result.append(cluster)
+        flush_ascii()
+        return result
+
+    def _run_kind(self, cluster: str) -> str:
+        if cluster in self._known_emojis:
+            return "emoji"
+        if all(self._ignorable(value) or ord(value) in self._coverage for value in cluster):
+            return "pillow"
+        return "pango"
+
+    def layout_line(
+        self, text: str, size: int, component: str = "text.line-layout"
+    ) -> _HybridLine:
+        cache_key = (text, int(size))
+        cached = self._line_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        primary = self.primary_font(size)
+        if self.primary_covers(text):
+            clusters = self.tokens(text)
+        else:
+            clusters = []
+            for token in self._mixed_tokens(text):
+                if token in self._known_emojis:
+                    clusters.append(token)
+                else:
+                    clusters.extend(self._pango().graphemes(token))
+
+        grouped: list[tuple[str, str]] = []
+        for cluster in clusters:
+            kind = self._run_kind(cluster)
+            if grouped and grouped[-1][0] == kind and kind != "emoji":
+                previous_kind, previous_text = grouped[-1]
+                grouped[-1] = (previous_kind, previous_text + cluster)
+            else:
+                grouped.append((kind, cluster))
+
+        runs: list[_TextRun] = []
+        cursor = 0.0
+        bounds: list[tuple[float, float, float, float]] = []
+        for kind, value in grouped:
+            if kind == "emoji":
+                advance = float(size)
+                bbox = (0.0, -float(size), advance, 0.0)
+            elif kind == "pillow":
+                advance = float(primary.getlength(self.drawable(value)))
+                raw_bbox = primary.getbbox(self.drawable(value), anchor="ls")
+                bbox = tuple(float(number) for number in raw_bbox)
+            else:
+                advance, bbox = self._pango().run_metrics(
+                    value, size, f"{component}.pango"
+                )
+            runs.append(_TextRun(kind, value, advance, bbox))
+            bounds.append(
+                (cursor + bbox[0], bbox[1], cursor + bbox[2], bbox[3])
+            )
+            cursor += advance
+
+        if bounds:
+            line_bbox = (
+                min(bound[0] for bound in bounds),
+                min(bound[1] for bound in bounds),
+                max(bound[2] for bound in bounds),
+                max(bound[3] for bound in bounds),
+            )
+        else:
+            line_bbox = (0.0, 0.0, 0.0, 0.0)
+        line = _HybridLine(text, tuple(runs), cursor, line_bbox)
+        self._line_cache[cache_key] = line
+        return line
+
+    def wrap(
+        self,
+        text: str,
+        text_font: _HybridFont,
+        max_width: int,
+        component: str = "text.wrap",
+    ) -> list[list[str] | _HybridLine]:
+        if not text:
+            return []
+        if self.primary_covers(text):
+            return self._legacy_wrap(text, text_font, max_width)
+
+        lines: list[_HybridLine] = []
+        for paragraph in text.replace("\t", " ").split("\n"):
+            if not paragraph:
+                lines.append(self.layout_line("", text_font.size, component))
+                continue
+            current = ""
+            tokens: list[str] = []
+            for token in self._mixed_tokens(paragraph):
+                if (
+                    token not in self._known_emojis
+                    and self.layout_line(token, text_font.size, component).advance
+                    > max_width
+                ):
+                    tokens.extend(self._pango().graphemes(token))
+                else:
+                    tokens.append(token)
+            for token in tokens:
+                candidate = current + token
+                candidate_line = self.layout_line(candidate, text_font.size, component)
+                if current and candidate_line.advance > max_width:
+                    lines.append(self.layout_line(current, text_font.size, component))
+                    current = token
+                else:
+                    current = candidate
+            if current:
+                lines.append(self.layout_line(current, text_font.size, component))
+        return lines
+
+    def measure(
+        self, text: str, size: int, component: str = "text.measure"
+    ) -> float:
+        if not text:
+            return 0.0
+        primary = self.primary_font(size)
+        if self.primary_covers(text) and not self.has_known_emoji(text):
+            return float(primary.getlength(self.drawable(text)))
+        return self.layout_line(text, size, component).advance
+
+    def bbox(
+        self, text: str, size: int, component: str = "text.bbox"
+    ) -> tuple[int, int, int, int]:
+        if not text:
+            return (0, 0, 0, 0)
+        primary = self.primary_font(size)
+        if self.primary_covers(text) and not self.has_known_emoji(text):
+            return tuple(int(value) for value in primary.getbbox(self.drawable(text)))
+        line = self.layout_line(text, size, component)
+        ascent, _descent = primary.getmetrics()
+        return (
+            math.floor(line.bbox[0]),
+            math.floor(ascent + line.bbox[1]),
+            math.ceil(line.bbox[2]),
+            math.ceil(ascent + line.bbox[3]),
+        )
+
+    def render_line(
+        self,
+        image,
+        pillow_draw,
+        line: _HybridLine,
+        xy: tuple[float, float],
+        text_font: _HybridFont,
+        fill: tuple[int, ...],
+        emoji_image,
+        line_height: int | None = None,
+        component: str = "text.line-render",
+    ) -> None:
+        origin_x = float(xy[0])
+        origin_y = float(xy[1])
+        ascent, _descent = text_font.primary.getmetrics()
+        baseline = origin_y + ascent
+        cursor = 0.0
+        for run in line.runs:
+            x = round(origin_x + cursor)
+            if run.renderer == "pillow":
+                pillow_draw.text(
+                    (x, round(baseline)),
+                    self.drawable(run.text),
+                    font=text_font.primary,
+                    fill=fill,
+                    anchor="ls",
+                )
+            elif run.renderer == "pango":
+                layer, offset = self._pango().render_run(
+                    run.text, text_font.size, fill, f"{component}.pango"
+                )
+                image.paste(
+                    layer,
+                    (x + offset[0], round(baseline) + offset[1]),
+                    layer,
+                )
+            else:
+                icon = emoji_image(run.text, text_font.size)
+                if line_height is None:
+                    icon_y = round(baseline - text_font.size)
+                else:
+                    icon_y = round(
+                        origin_y + max(0, (line_height - text_font.size) // 2)
+                    )
+                if icon is not None:
+                    image.paste(icon, (x, icon_y), icon)
+                else:
+                    size_px = text_font.size
+                    pillow_draw.rounded_rectangle(
+                        (x + 2, icon_y + 2, x + size_px - 2, icon_y + size_px - 2),
+                        radius=max(2, size_px // 6),
+                        fill=(239, 243, 246),
+                        outline=(160, 174, 184),
+                    )
+            cursor += run.advance
 
 
 def _run(spec: dict[str, Any]) -> list[str]:
@@ -504,10 +936,10 @@ def _run(spec: dict[str, Any]) -> list[str]:
     emoji_paths = {key: Path(value) for key, value in raw_emoji_paths.items() if value}
     emoji_cache: dict[tuple[str, int], Any] = {}
 
-    text_backend = _PangoTextBackend(font_path, known_emojis, Image, ImageFont)
-    font_cache: dict[int, _PangoFont] = {}
+    text_backend = _HybridTextBackend(font_path, known_emojis, Image, ImageFont)
+    font_cache: dict[int, _HybridFont] = {}
 
-    def font(size: int) -> _PangoFont:
+    def font(size: int) -> _HybridFont:
         normalized = int(size)
         if normalized not in font_cache:
             font_cache[normalized] = text_backend.font(normalized)
@@ -542,7 +974,58 @@ def _run(spec: dict[str, Any]) -> list[str]:
         emoji_cache[cache_key] = rendered
         return rendered
 
-    class PangoDraw:
+    def normalized_fill(fill) -> tuple[int, ...]:
+        if isinstance(fill, int):
+            return (fill, fill, fill, 255)
+        return tuple(fill)
+
+    def draw_legacy_line(
+        image,
+        pillow_draw,
+        values: list[str],
+        xy,
+        text_font: _HybridFont,
+        fill,
+        line_height: int | None,
+    ) -> None:
+        x = round(float(xy[0]))
+        y = round(float(xy[1]))
+        for value in values:
+            icon = emoji_image(value, text_font.size)
+            if icon is not None:
+                icon_y = (
+                    y
+                    if line_height is None
+                    else y + max(0, (line_height - icon.height) // 2)
+                )
+                image.paste(icon, (x, icon_y), icon)
+                x += text_font.size
+                continue
+            if value in known_emojis:
+                size = text_font.size
+                top = (
+                    y
+                    if line_height is None
+                    else y + max(1, (line_height - size) // 2)
+                )
+                pillow_draw.rounded_rectangle(
+                    (x + 2, top + 2, x + size - 2, top + size - 2),
+                    radius=max(2, size // 6),
+                    fill=(239, 243, 246),
+                    outline=(160, 174, 184),
+                )
+                x += size
+                continue
+            drawable = text_backend.drawable(value)
+            try:
+                pillow_draw.text(
+                    (x, y), drawable, font=text_font.primary, fill=fill
+                )
+            except (OSError, UnicodeEncodeError):
+                pillow_draw.text((x, y), "?", font=text_font.primary, fill=fill)
+            x += text_backend.token_width(value, text_font)
+
+    class HybridDraw:
         def __init__(self, image) -> None:
             self.image = image
             self.pillow_draw = ImageDraw.Draw(image)
@@ -560,44 +1043,60 @@ def _run(spec: dict[str, Any]) -> list[str]:
             component="text.render",
             **kwargs,
         ):
-            if not isinstance(font, _PangoFont):
+            if not isinstance(font, _HybridFont):
                 return self.pillow_draw.text(
                     xy, value, font=font, fill=fill, **kwargs
                 )
-            layer, offset, placements = text_backend.render(
-                str(value), font.size, tuple(fill), str(component)
-            )
-            origin_x = round(float(xy[0]))
-            origin_y = round(float(xy[1]))
-            self.image.paste(
-                layer,
-                (origin_x + offset[0], origin_y + offset[1]),
-                layer,
-            )
-            for token, slot_x, slot_y in placements:
-                icon = emoji_image(token, font.size)
-                destination = (origin_x + slot_x, origin_y + slot_y)
-                if icon is not None:
-                    self.image.paste(icon, destination, icon)
-                    continue
-                x, y = destination
-                size = font.size
-                self.pillow_draw.rounded_rectangle(
-                    (x + 2, y + 2, x + size - 2, y + size - 2),
-                    radius=max(2, size // 6),
-                    fill=(239, 243, 246),
-                    outline=(160, 174, 184),
+            if isinstance(value, _HybridLine):
+                line = value
+            elif isinstance(value, list):
+                draw_legacy_line(
+                    self.image, self.pillow_draw, value, xy, font, fill, None
                 )
+                return None
+            else:
+                rendered_value = str(value)
+                if text_backend.primary_covers(
+                    rendered_value
+                ) and not text_backend.has_known_emoji(rendered_value):
+                    return self.pillow_draw.text(
+                        xy,
+                        text_backend.drawable(rendered_value),
+                        font=font.primary,
+                        fill=fill,
+                        **kwargs,
+                    )
+                line = text_backend.layout_line(
+                    rendered_value, font.size, str(component)
+                )
+            text_backend.render_line(
+                self.image,
+                self.pillow_draw,
+                line,
+                xy,
+                font,
+                normalized_fill(fill),
+                emoji_image,
+                component=str(component),
+            )
             return None
 
         def textbbox(
             self, xy, value, *, font=None, component="text.bbox", **kwargs
         ):
-            if not isinstance(font, _PangoFont):
+            if not isinstance(font, _HybridFont):
                 return self.pillow_draw.textbbox(xy, value, font=font, **kwargs)
-            left, top, right, bottom = text_backend.bbox(
-                str(value), font.size, str(component)
-            )
+            rendered_value = str(value)
+            if text_backend.primary_covers(
+                rendered_value
+            ) and not text_backend.has_known_emoji(rendered_value):
+                return self.pillow_draw.textbbox(
+                    xy,
+                    text_backend.drawable(rendered_value),
+                    font=font.primary,
+                    **kwargs,
+                )
+            left, top, right, bottom = text_backend.bbox(rendered_value, font.size, str(component))
             origin_x = round(float(xy[0]))
             origin_y = round(float(xy[1]))
             return (
@@ -607,21 +1106,21 @@ def _run(spec: dict[str, Any]) -> list[str]:
                 origin_y + bottom,
             )
 
-    def text_draw(image) -> PangoDraw:
-        return PangoDraw(image)
+    def text_draw(image) -> HybridDraw:
+        return HybridDraw(image)
 
     def wrap(
         text: str,
-        text_font: _PangoFont,
+        text_font: _HybridFont,
         max_width: int,
         component: str = "text.wrap",
-    ) -> list[str]:
-        return text_backend.wrap(text, text_font.size, max_width, component)
+    ) -> list[list[str] | _HybridLine]:
+        return text_backend.wrap(text, text_font, max_width, component)
 
     def draw_lines(
         image,
         draw,
-        lines: list[str],
+        lines: list[list[str] | _HybridLine],
         xy: tuple[int, int],
         text_font,
         fill: tuple[int, int, int],
@@ -630,24 +1129,62 @@ def _run(spec: dict[str, Any]) -> list[str]:
     ) -> int:
         start_x, y = xy
         for line in lines:
-            draw.text(
-                (start_x, y),
-                line,
-                font=text_font,
-                fill=fill,
-                component=component,
-            )
+            if isinstance(line, _HybridLine):
+                text_backend.render_line(
+                    image,
+                    draw.pillow_draw,
+                    line,
+                    (start_x, y),
+                    text_font,
+                    normalized_fill(fill),
+                    emoji_image,
+                    line_height=line_height,
+                    component=component,
+                )
+            else:
+                draw_legacy_line(
+                    image,
+                    draw.pillow_draw,
+                    line,
+                    (start_x, y),
+                    text_font,
+                    fill,
+                    line_height,
+                )
             y += line_height
         return y
 
     def draw_text(
         draw,
         xy,
-        value: str,
+        value,
         text_font,
         fill,
         component: str = "text",
     ) -> None:
+        if isinstance(value, _HybridLine):
+            text_backend.render_line(
+                draw.image,
+                draw.pillow_draw,
+                value,
+                xy,
+                text_font,
+                normalized_fill(fill),
+                emoji_image,
+                component=f"{component}.render",
+            )
+            return
+        if isinstance(value, list):
+            draw_legacy_line(
+                draw.image,
+                draw.pillow_draw,
+                value,
+                xy,
+                text_font,
+                fill,
+                None,
+            )
+            return
         draw.text(
             xy, value, font=text_font, fill=fill, component=f"{component}.render"
         )
