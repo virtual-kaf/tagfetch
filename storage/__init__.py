@@ -1,6 +1,7 @@
 from .database import (
     get_delivery,
     get_enabled_group_ids,
+    get_remote_discovery_failures,
     has_delivery,
     has_pending_delivery,
     initialize_database,
@@ -8,13 +9,16 @@ from .database import (
     is_rejected,
     mark_originals_sent,
     record_card_delivery,
+    record_remote_discovery_failure,
     record_rejection,
+    reset_remote_discovery_failures,
     set_group_enabled,
 )
 
 __all__ = [
     "get_delivery",
     "get_enabled_group_ids",
+    "get_remote_discovery_failures",
     "has_delivery",
     "has_pending_delivery",
     "initialize_database",
@@ -22,6 +26,8 @@ __all__ = [
     "is_rejected",
     "mark_originals_sent",
     "record_card_delivery",
+    "record_remote_discovery_failure",
     "record_rejection",
+    "reset_remote_discovery_failures",
     "set_group_enabled",
 ]

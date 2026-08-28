@@ -223,6 +223,13 @@ TAGFETCH_REMOTE_HOST = _get_config_str(
 TAGFETCH_REMOTE_PORT = _get_config_str("KABUBU_TAGFETCH_REMOTE_PORT", "8766").strip()
 TAGFETCH_REMOTE_TOKEN = _get_config_str("KABUBU_TAGFETCH_REMOTE_TOKEN", "").strip()
 
+TWITTERAPI_IO_API_KEY = _get_config_str(
+    "KABUBU_TWITTERAPI_IO_API_KEY", ""
+).strip()
+TWITTERAPI_IO_API_BASE = _get_config_str(
+    "KABUBU_TWITTERAPI_IO_API_BASE", "https://api.twitterapi.io"
+).rstrip("/")
+
 GROK_API_URL = _get_config_str(
     "KABUBU_GROK_API_URL", "http://127.0.0.1:8000/v1/chat/completions"
 ).strip()

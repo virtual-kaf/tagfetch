@@ -1,7 +1,8 @@
 # tagfetch remote Grok service
 
 This standalone authenticated service performs only Grok hashtag discovery. It
-never imports QQ delivery state, calls TwitterAPI, or performs a fallback.
+never imports QQ delivery state, calls twitterapi.io, or performs a fallback.
+The QQ-side plugin owns the fallback policy and its persistent failure counter.
 
 ## Configuration
 
@@ -22,6 +23,20 @@ python -m nonebot_plugin_tagfetch.remote_service
 ```
 
 The endpoint is `POST /api/tagfetch/poll`. It accepts the authenticated fixed
-query contract used by the QQ plugin: tags, minimum 300 likes, a two-hour
+query contract used by the QQ plugin: tags, minimum 300 likes, a 24-hour
 lookback, and at most three URLs per tag. Grok or schema failures return an
-error response; callers must not fall back to another discovery source.
+error response.
+
+On the QQ side, connection failures and HTTP 5xx responses are counted across
+polls. Every third consecutive failure consumes one twitterapi.io advanced
+search attempt, but only from 08:00 through 23:59 China Standard Time. A Grok
+success resets the counter. Disabled, invalid, or unauthorized remote-service
+configuration does not trigger the paid fallback.
+
+Configure the fallback only on the QQ/tagfetch host (the same names are used by
+xfetch, so one key/base setting can be shared):
+
+```dotenv
+KABUBU_TWITTERAPI_IO_API_KEY=replace-with-a-twitterapi-io-key
+# Optional: KABUBU_TWITTERAPI_IO_API_BASE=https://api.twitterapi.io
+```

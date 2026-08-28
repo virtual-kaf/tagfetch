@@ -9,8 +9,9 @@ from zoneinfo import ZoneInfo
 
 from nonebot import logger
 
+from ..clients.discovery import fetch_discovered_posts
 from ..clients.fxtwitter import fetch_conversation
-from ..clients.remote_grok import RemoteDiscoveryError, remote_fetch_urls
+from ..clients.remote_grok import RemoteDiscoveryError
 from ..config import FETCH_CONCURRENCY, LOOKBACK, MIN_LIKES
 from ..models import DiscoveredPost, PreparedCandidate
 from ..models.tweet import TweetConversation
@@ -91,13 +92,13 @@ async def run_tagfetch_pipeline(
         logger.info("[TagfetchPipeline] run skipped reason=missing_tags_or_groups")
         return []
     try:
-        discovered = await remote_fetch_urls(tags)
+        discovered = await fetch_discovered_posts(tags)
         logger.info(
             "[TagfetchPipeline] discovery finished candidates={}", len(discovered)
         )
     except RemoteDiscoveryError as exc:
         logger.warning(
-            "[TagfetchPipeline] remote Grok failed without fallback: {}",
+            "[TagfetchPipeline] discovery unavailable: {}",
             exc.reason,
         )
         return []

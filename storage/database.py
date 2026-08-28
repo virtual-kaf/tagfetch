@@ -52,7 +52,60 @@ def initialize_database(path: Path = STATE_DB) -> None:
                 originals_sent_at TEXT,
                 PRIMARY KEY (tweet_id, group_id)
             );
+            CREATE TABLE IF NOT EXISTS discovery_health (
+                source TEXT PRIMARY KEY,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0
+                    CHECK (consecutive_failures >= 0),
+                updated_at TEXT NOT NULL
+            );
             """
+        )
+
+
+def get_remote_discovery_failures(*, path: Path = STATE_DB) -> int:
+    initialize_database(path)
+    with _connect(path) as connection:
+        row = connection.execute(
+            "SELECT consecutive_failures FROM discovery_health WHERE source = ?",
+            ("remote_grok",),
+        ).fetchone()
+    return int(row["consecutive_failures"]) if row is not None else 0
+
+
+def record_remote_discovery_failure(*, path: Path = STATE_DB) -> int:
+    initialize_database(path)
+    with _DB_LOCK, _connect(path) as connection:
+        connection.execute(
+            """
+            INSERT INTO discovery_health
+                (source, consecutive_failures, updated_at)
+            VALUES (?, 1, ?)
+            ON CONFLICT(source) DO UPDATE SET
+                consecutive_failures = consecutive_failures + 1,
+                updated_at = excluded.updated_at
+            """,
+            ("remote_grok", _utc_now()),
+        )
+        row = connection.execute(
+            "SELECT consecutive_failures FROM discovery_health WHERE source = ?",
+            ("remote_grok",),
+        ).fetchone()
+    return int(row["consecutive_failures"])
+
+
+def reset_remote_discovery_failures(*, path: Path = STATE_DB) -> None:
+    initialize_database(path)
+    with _DB_LOCK, _connect(path) as connection:
+        connection.execute(
+            """
+            INSERT INTO discovery_health
+                (source, consecutive_failures, updated_at)
+            VALUES (?, 0, ?)
+            ON CONFLICT(source) DO UPDATE SET
+                consecutive_failures = 0,
+                updated_at = excluded.updated_at
+            """,
+            ("remote_grok", _utc_now()),
         )
 
 
