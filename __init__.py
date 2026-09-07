@@ -13,7 +13,7 @@ else:
 
     from .commands import artworks_cmd
     from .renderer import shutdown as shutdown_renderer
-    from .scheduler import check_tagfetch
+    from .scheduler import check_tagfetch, dispatch_tagfetch_pending
     from .storage import initialize_database
 
     initialize_database()
@@ -27,4 +27,4 @@ else:
         supported_adapters={"~onebot.v11"},
     )
 
-    __all__ = ["artworks_cmd", "check_tagfetch"]
+    __all__ = ["artworks_cmd", "check_tagfetch", "dispatch_tagfetch_pending"]

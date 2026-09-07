@@ -1,4 +1,4 @@
-"""Two-hour CST scheduler for the tagfetch pipeline."""
+"""Two-hour discovery plus hourly FIFO delivery for tagfetch."""
 
 from time import monotonic
 
@@ -9,8 +9,12 @@ from nonebot_plugin_apscheduler import scheduler
 
 from .config import CST, TAGS
 from .core import run_tagfetch_pipeline
-from .services import broadcast_to_groups, is_master_on
-from .storage import get_enabled_group_ids
+from .services import (
+    dispatch_one_pending_candidate,
+    enqueue_prepared_candidates,
+    is_master_on,
+)
+from .storage import get_enabled_group_ids, get_pending_candidate_count
 
 
 async def get_active_group_ids(bot) -> list[str]:
@@ -81,11 +85,64 @@ async def check_tagfetch() -> None:
             "[TagfetchScheduler] pipeline finished prepared_candidates={}",
             len(candidates),
         )
-        await broadcast_to_groups(bot, candidates, group_ids)
+        queued, duplicates = enqueue_prepared_candidates(candidates)
+        logger.info(
+            "[TagfetchScheduler] queue updated queued={} duplicates={} "
+            "pending_total={}",
+            queued,
+            duplicates,
+            get_pending_candidate_count(),
+        )
     except Exception:  # noqa: BLE001 - scheduler boundary must not leak failures
         logger.exception("[TagfetchScheduler] scheduled run failed")
     finally:
         logger.info(
             "[TagfetchScheduler] poll finished elapsed_seconds={:.2f}",
+            monotonic() - started,
+        )
+
+
+@scheduler.scheduled_job(
+    "cron",
+    hour="*",
+    minute="35",
+    timezone=CST,
+    id="tagfetch_pending_dispatch",
+    max_instances=1,
+    coalesce=True,
+)
+async def dispatch_tagfetch_pending() -> None:
+    """Send at most one queued tweet to all currently active groups."""
+    started = monotonic()
+    logger.info(
+        "[TagfetchScheduler] pending dispatch started pending_total={}",
+        get_pending_candidate_count(),
+    )
+    try:
+        bot = get_bot()
+    except Exception:  # noqa: BLE001 - NoneBot may expose adapter-specific errors
+        logger.warning(
+            "[TagfetchScheduler] pending dispatch skipped reason=bot_unavailable"
+        )
+        return
+    group_ids = await get_active_group_ids(bot)
+    if not group_ids:
+        logger.info(
+            "[TagfetchScheduler] pending dispatch skipped reason=no_active_groups"
+        )
+        return
+    try:
+        result = await dispatch_one_pending_candidate(bot, group_ids)
+        logger.info(
+            "[TagfetchScheduler] pending dispatch finished result={} "
+            "pending_total={}",
+            result,
+            get_pending_candidate_count(),
+        )
+    except Exception:  # noqa: BLE001 - queue entry remains for the next hour
+        logger.exception("[TagfetchScheduler] pending dispatch failed")
+    finally:
+        logger.info(
+            "[TagfetchScheduler] pending dispatch elapsed_seconds={:.2f}",
             monotonic() - started,
         )

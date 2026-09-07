@@ -15,7 +15,12 @@ from ..clients.remote_grok import RemoteDiscoveryError
 from ..config import FETCH_CONCURRENCY, LOOKBACK, MIN_LIKES
 from ..models import DiscoveredPost, PreparedCandidate
 from ..models.tweet import TweetConversation
-from ..storage import has_pending_delivery, is_rejected, record_rejection
+from ..storage import (
+    has_pending_delivery,
+    is_pending_candidate,
+    is_rejected,
+    record_rejection,
+)
 from .media import (
     MediaDownloadError,
     download_candidate_images,
@@ -105,6 +110,13 @@ async def run_tagfetch_pipeline(
 
     pending: list[DiscoveredPost] = []
     for post in discovered:
+        if is_pending_candidate(post.tweet_id):
+            logger.info(
+                "[TagfetchPipeline] candidate skipped tweet={} "
+                "reason=already_in_pending_queue",
+                post.tweet_id,
+            )
+            continue
         if is_rejected(post.tweet_id):
             logger.info(
                 "[TagfetchPipeline] candidate skipped tweet={} "

@@ -40,3 +40,23 @@ xfetch, so one key/base setting can be shared):
 KABUBU_TWITTERAPI_IO_API_KEY=replace-with-a-twitterapi-io-key
 # Optional: KABUBU_TWITTERAPI_IO_API_BASE=https://api.twitterapi.io
 ```
+
+## Pending delivery queue
+
+Discovery still runs every two hours at minute 30, but approved candidates are
+now stored in the SQLite `pending_candidates` FIFO instead of being broadcast
+immediately. At minute 35 of every hour, tagfetch attempts one queued tweet and
+sends that tweet to every currently active group. The `pending_dispatch_hours`
+table is the persistent global hour gate, so a restart or duplicate invocation
+cannot send a second queued tweet in the same China Standard Time hour.
+
+A candidate is removed only after its card has been delivered to every active
+group. An incomplete attempt keeps its spooled originals, moves the candidate
+to the back of the queue, and retries it in a later hour without blocking newer
+entries.
+
+Queue depth can be inspected with:
+
+```sql
+SELECT COUNT(*) FROM pending_candidates;
+```

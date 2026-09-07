@@ -654,10 +654,20 @@ async def _broadcast_to_groups(
 
 
 async def broadcast_to_groups(
-    bot: Bot, candidates: list[PreparedCandidate], group_ids: list[str]
+    bot: Bot,
+    candidates: list[PreparedCandidate],
+    group_ids: list[str],
+    *,
+    cleanup: bool = True,
 ) -> None:
-    """Broadcast a round and always release its spooled original files."""
+    """Broadcast a round, optionally retaining spooled files for queue retries."""
     try:
         await _broadcast_to_groups(bot, candidates, group_ids)
     finally:
-        _cleanup_spooled_originals(candidates)
+        if cleanup:
+            _cleanup_spooled_originals(candidates)
+
+
+def cleanup_spooled_originals(candidates: list[PreparedCandidate]) -> None:
+    """Release candidate originals after a durable queue entry is completed."""
+    _cleanup_spooled_originals(candidates)
