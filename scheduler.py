@@ -48,7 +48,7 @@ async def get_active_group_ids(bot) -> list[str]:
 
 @scheduler.scheduled_job(
     "cron",
-    hour="*/2",
+    hour="*",
     minute="30",
     timezone=CST,
     id="tagfetch_monitor",
